@@ -46,6 +46,13 @@ function tasksWithExpiredLeases(tasks, now = new Date()) {
  * busy-loops: a task whose lease is already expired is reclaimed promptly but
  * not in a spin.
  *
+ * The delay is never larger than `maxDelayMs` (when finite and >= 1): a
+ * far-future lease (beyond Node's setTimeout practical max of ~24.8 days)
+ * would otherwise arm a timer that Node clamps to ~1ms, busy-looping recovery.
+ * Capping lets the recovery callback fire within the timer max and re-arm
+ * against the absolute expiry, so the task is still reclaimed promptly once
+ * its lease actually expires.
+ *
  * @param {Array} tasks
  * @param {Date} now
  * @param {object} [options]
@@ -54,7 +61,17 @@ function tasksWithExpiredLeases(tasks, now = new Date()) {
 function nextLeaseRecoveryDelay(tasks, now = new Date(), options = {}) {
 	const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
 	if (!Number.isFinite(nowMs)) return null;
-	const minDelayMs = Math.max(1, Number(options.minDelayMs ?? 1000));
+	// Defensive minDelayMs: only a finite number >= 1 is honored; anything else
+	// (NaN, Infinity, <=0, non-numeric) falls back to the 1000ms default. This
+	// prevents NaN from poisoning the recovery delay (Math.max(1, NaN) === NaN)
+	// and keeps recovery from busy-looping on a malformed option.
+	const rawMin = Number(options.minDelayMs);
+	const minDelayMs = Number.isFinite(rawMin) && rawMin >= 1 ? rawMin : 1000;
+	// Optional upper bound. Validated the same shape as minDelayMs: only a finite
+	// number >= 1 is honored, so a malformed/absent value leaves the delay
+	// uncapped (preserving prior behavior) rather than clamping to 0.
+	const rawMax = Number(options.maxDelayMs);
+	const maxDelayMs = Number.isFinite(rawMax) && rawMax >= 1 ? rawMax : null;
 	if (!Array.isArray(tasks)) return null;
 	let earliest = null;
 	for (const task of tasks) {
@@ -66,8 +83,15 @@ function nextLeaseRecoveryDelay(tasks, now = new Date(), options = {}) {
 	if (earliest === null) return null;
 	const raw = earliest - nowMs;
 	// Always at least minDelayMs so a just-expired lease does not spin; if the
-	// earliest lease is far in the future, wait until just past it.
-	return Math.max(minDelayMs, raw + 1);
+	// earliest lease is far in the future, wait until just past it (clamped to
+	// maxDelayMs when provided so the timer never exceeds Node's practical max).
+	let delay = Math.max(minDelayMs, raw + 1);
+	if (maxDelayMs !== null) {
+		// The effective cap never drops the result below minDelayMs, so a
+		// caller-supplied maxDelayMs below minDelayMs cannot busy-loop recovery.
+		delay = Math.min(delay, Math.max(maxDelayMs, minDelayMs));
+	}
+	return delay;
 }
 
 /**
@@ -179,6 +203,115 @@ function renderCommand(command) {
 	return "(no command)";
 }
 
+/**
+ * Settle a claimed task's fire-time execution lifecycle, isolating the policy
+ * concerns that were previously inlined (and conflated) inside index.ts's
+ * fireTask try/catch/finally. This is HIGH fix 1: separate executeTask
+ * rejection from success-completion/reload errors.
+ *
+ * Dependencies are INJECTED so this helper is pure to test with fakes (no Pi
+ * process, no store, no UI). The caller (index.ts) wires them to its real
+ * execute/complete/reload implementations and its live-session gate.
+ *
+ * Invariants enforced here, regardless of `isLive()`:
+ *   * `execute()` rejection is the ONLY outcome that may persist `{ok:false}`.
+ *     It is always attempted regardless of liveness, so lease recovery never
+ *     re-executes a failed task.
+ *   * After `execute()` returns a result, completion with `{result, ok}` is
+ *     ALWAYS attempted regardless of liveness (the action may have produced
+ *     external side effects; leaving the claim running would re-fire it).
+ *   * A success/result COMPLETION error is NEVER downgraded to `{ok:false}`.
+ *     If live, it reports a PERSISTENCE failure; if not live, it is silent.
+ *     Either way no `{ok:false}` is written and no task-failed is reported.
+ *   * `reload()` and the failure/persistence reports are gated on `isLive()`.
+ *   * A `reload()` error after durable success never reports task-failed
+ *     (reload is best-effort) and never downgrades to `{ok:false}`.
+ *
+ * The caller owns the unconditional `firing.delete` and live-only
+ * `rescheduleAll` (still in index.ts's finally).
+ *
+ * @param {object} task the claimed task
+ * @param {object} claim claim descriptor (taskId, runnerId, claimToken, claimGeneration). Kept in the signature for API clarity/stability; the caller's injected `complete` closure is responsible for using the claim identity, so the helper itself does not read it.
+ * @param {object} deps injected behavior
+ * @param {() => Promise<any>} deps.execute runs the task action; rejection => ok:false
+ * @param {(payload: {result?: any, ok: boolean}) => Promise<void>} deps.complete persists the outcome
+ * @param {() => Promise<void>} [deps.reload] best-effort in-memory mirror refresh (live only)
+ * @param {() => boolean} deps.isLive true while the session is still live
+ * @param {(error: any, task: object) => void} [deps.reportTaskFailure] live failure surface (UI/message)
+ * @param {(error: any, task: object, result: any) => void} [deps.reportPersistenceFailure] live persistence-failure surface
+ * @returns {Promise<void>}
+ */
+async function runClaimedExecution(task, _claim, deps) {
+	const {
+		execute,
+		complete,
+		reload,
+		isLive,
+		reportTaskFailure,
+		reportPersistenceFailure,
+	} = deps;
+
+	let result;
+	let executeRejected = false;
+	let executeError;
+	try {
+		result = await execute(task);
+	} catch (error) {
+		executeRejected = true;
+		executeError = error;
+	}
+
+	if (executeRejected) {
+		// Only an execute rejection may persist ok:false. This is unconditional
+		// (not gated on isLive) so lease recovery does not normally re-execute the
+		// task. If persistence itself fails, preserve both error identities rather
+		// than suppressing the original task-failure report.
+		let completionError;
+		try {
+			await complete({ result: undefined, ok: false });
+		} catch (error) {
+			completionError = error;
+		}
+		if (isLive()) {
+			if (completionError) {
+				if (reportPersistenceFailure) {
+					reportPersistenceFailure(completionError, task, undefined);
+				}
+			} else {
+				try {
+					if (reload) await reload();
+				} catch {
+					// reload is best-effort after durable failed completion.
+				}
+			}
+			if (reportTaskFailure) reportTaskFailure(executeError, task);
+		}
+		return;
+	}
+
+	// execute() returned a result. Completion with {result, ok} is always
+	// attempted regardless of liveness; ok reflects the result, not a failure
+	// elsewhere. A completion error here is NEVER downgraded to ok:false.
+	try {
+		await complete({ result, ok: result?.ok !== false });
+	} catch (completionError) {
+		if (isLive() && reportPersistenceFailure) {
+			reportPersistenceFailure(completionError, task, result);
+		}
+		return;
+	}
+
+	// Completion is durable. reload is best-effort and live-gated; its failure
+	// never reports task-failed and never downgrades to ok:false.
+	if (isLive() && reload) {
+		try {
+			await reload();
+		} catch {
+			// reload is best-effort after durable success; swallow.
+		}
+	}
+}
+
 module.exports = {
 	tasksWithExpiredLeases,
 	nextLeaseRecoveryDelay,
@@ -187,4 +320,5 @@ module.exports = {
 	redactResultForMessage,
 	shellCompletionMessage,
 	renderCommand,
+	runClaimedExecution,
 };

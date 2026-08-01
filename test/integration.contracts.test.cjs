@@ -637,24 +637,16 @@ test("lifecycle recovery: a group-writable policy file fails closed at fire time
 	});
 });
 
-test("completed side effects are persisted even when shutdown occurs during execution", () => {
+test("index.ts wires fireTask execution settle through runClaimedExecution", () => {
+	// MEDIUM fix: replace brittle source-regex contracts with a single minimal
+	// wiring assertion proving index.ts delegates the fire-time settle to the
+	// behavioral helper. The full behavior (success-after-shutdown, execute
+	// rejection after shutdown, success-completion-throws, reload-throws) is
+	// covered behaviorally in scheduler-runtime.contracts.test.cjs via injected
+	// fakes, so a wording change in index.ts no longer risks a false failure.
 	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
-	const execution = source.indexOf(
-		"const result = await executeTask(task, ctx);",
-	);
-	const completion = source.indexOf(
-		"await taskStore.completeClaimedTask({",
-		execution,
-	);
-
-	assert.ok(execution >= 0, "fireTask execution wiring must exist");
 	assert.ok(
-		completion > execution,
-		"execution must be followed by persistence",
-	);
-	assert.doesNotMatch(
-		source.slice(execution, completion),
-		/if\s*\(\s*generation\s*!==\s*sessionGeneration\s*\|\|\s*isShutdown\s*\)\s*return/,
-		"shutdown after executeTask must not skip persisted completion",
+		/runtime\.runClaimedExecution\(/.test(source),
+		"fireTask must settle claimed execution through runtime.runClaimedExecution",
 	);
 });

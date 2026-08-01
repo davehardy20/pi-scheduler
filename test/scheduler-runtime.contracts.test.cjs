@@ -23,6 +23,7 @@ const {
 	redactResultForMessage,
 	shellCompletionMessage,
 	renderCommand,
+	runClaimedExecution,
 } = require(RUNTIME_PATH);
 
 const NOW = new Date("2026-07-05T12:00:00Z");
@@ -103,6 +104,61 @@ test("nextLeaseRecoveryDelay returns null when no running task has a lease", () 
 		nextLeaseRecoveryDelay([{ id: "p", status: "pending" }], NOW),
 		null,
 	);
+});
+
+test("nextLeaseRecoveryDelay caps a far-future lease at the supplied maxDelayMs", () => {
+	// A lease far beyond Node's setTimeout max (~24.8 days) MUST be capped so
+	// the recovery timer does not fire immediately (Node clamps an over-max
+	// delay to ~1ms, which would busy-loop recovery). The cap lets the expiry
+	// callback re-arm against the absolute expiry once it fires.
+	const MAX = 2_147_483_647; // Node setTimeout practical max
+	const farFuture = new Date(NOW.getTime() + 90 * 24 * 3600_000).toISOString(); // ~90 days
+	const tasks = [runningTask({ id: "far", claimLeaseExpiresAt: farFuture })];
+	const delay = nextLeaseRecoveryDelay(tasks, NOW, { maxDelayMs: MAX });
+	assert.ok(delay !== null, "a far-future lease must still schedule recovery");
+	assert.ok(
+		delay <= MAX,
+		`far-future recovery delay must be capped at maxDelayMs, got ${delay}`,
+	);
+	assert.ok(delay >= 1, "capped recovery delay must stay non-zero");
+});
+
+test("nextLeaseRecoveryDelay caps consistently regardless of how far out the lease is", () => {
+	const MAX = 2_147_483_647;
+	const near = new Date(NOW.getTime() + 10_000).toISOString();
+	const far = new Date(NOW.getTime() + 365 * 24 * 3600_000).toISOString();
+	const nearDelay = nextLeaseRecoveryDelay(
+		[runningTask({ id: "near", claimLeaseExpiresAt: near })],
+		NOW,
+		{ maxDelayMs: MAX },
+	);
+	const farDelay = nextLeaseRecoveryDelay(
+		[runningTask({ id: "far", claimLeaseExpiresAt: far })],
+		NOW,
+		{ maxDelayMs: MAX },
+	);
+	// A near lease stays under the cap (arms just past expiry); a far lease is
+	// clamped exactly to the cap.
+	assert.ok(nearDelay !== null && nearDelay <= MAX);
+	assert.equal(farDelay, MAX);
+});
+
+test("nextLeaseRecoveryDelay maxDelayMs validation mirrors minDelayMs (finite, >=1)", () => {
+	const expires = new Date(NOW.getTime() + 90 * 24 * 3600_000).toISOString();
+	const tasks = [runningTask({ id: "far", claimLeaseExpiresAt: expires })];
+	// A non-finite maxDelayMs is ignored (treated as unset), so the raw delay is
+	// returned uncapped — mirroring how minDelayMs falls back to its default.
+	assert.ok(
+		nextLeaseRecoveryDelay(tasks, NOW, { maxDelayMs: Number.NaN }) >
+			2_147_483_647,
+	);
+	// A maxDelayMs below the min floor would clamp to below minDelayMs; ensure
+	// the floor still wins so recovery never spins below minDelayMs.
+	const floored = nextLeaseRecoveryDelay(tasks, NOW, {
+		maxDelayMs: 0,
+		minDelayMs: 1000,
+	});
+	assert.ok(floored >= 1000, "minDelayMs floor must still apply");
 });
 
 // ---------------------------------------------------------------------------
@@ -234,4 +290,283 @@ test("renderCommand handles missing/odd shapes without [object Object]", () => {
 	assert.equal(renderCommand(undefined), "(no command)");
 	assert.equal(renderCommand({}), "(no executable)");
 	assert.equal(renderCommand({ executable: "date" }), "date");
+});
+
+// ---------------------------------------------------------------------------
+// LOW fix: defensive delay validation. minDelayMs must be a finite number >= 1
+// (else fall back to 1000), and an effective maxDelayMs must never drop the
+// result below minDelayMs. This keeps recovery from busy-looping below the
+// min floor even when a caller supplies a malformed maxDelayMs.
+// ---------------------------------------------------------------------------
+
+test("nextLeaseRecoveryDelay treats a NaN minDelayMs as the 1000 default", () => {
+	const tasks = [runningTask({ id: "expired" })]; // expired 60s ago
+	const delay = nextLeaseRecoveryDelay(tasks, NOW, { minDelayMs: Number.NaN });
+	assert.ok(delay !== null);
+	assert.ok(
+		delay >= 1000,
+		"NaN minDelayMs must fall back to the default floor, not produce NaN",
+	);
+});
+
+test("nextLeaseRecoveryDelay keeps the min floor when maxDelayMs < minDelayMs", () => {
+	const tasks = [runningTask({ id: "expired" })]; // expired 60s ago
+	const delay = nextLeaseRecoveryDelay(tasks, NOW, {
+		minDelayMs: 1000,
+		maxDelayMs: 1,
+	});
+	assert.ok(delay !== null);
+	assert.ok(
+		delay >= 1000,
+		"effective maxDelayMs must never drop the result below minDelayMs",
+	);
+});
+
+test("nextLeaseRecoveryDelay rejects non-finite/negative minDelayMs values", () => {
+	const tasks = [runningTask({ id: "expired" })];
+	for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -5, 0]) {
+		const delay = nextLeaseRecoveryDelay(tasks, NOW, { minDelayMs: bad });
+		assert.ok(
+			Number.isFinite(delay) && delay >= 1000,
+			`minDelayMs=${bad} must fall back to 1000, got ${delay}`,
+		);
+	}
+});
+
+// ---------------------------------------------------------------------------
+// HIGH fix + MEDIUM fix: runClaimedExecution behavioral contract.
+//
+// runClaimedExecution isolates the policy concerns of a claimed task's
+// fire-time settle:
+//   * Only an execute() REJECTION may persist ok:false.
+//   * After execute() returns a result, completion is always attempted
+//     regardless of liveness; a success/result completion error must NEVER be
+//     downgraded to ok:false (it reports persistence failure if live, only).
+//   * reload() and failure/persistence reports are gated on isLive().
+//   * reload failure after durable success never reports task-failed.
+//
+// These are pure behavioral tests using injected fakes (no Pi process, no
+// source-regex matching).
+// ---------------------------------------------------------------------------
+
+function makeFakes() {
+	return {
+		calls: {
+			complete: [],
+			reload: 0,
+			reportTaskFailure: [],
+			reportPersistenceFailure: [],
+		},
+	};
+}
+
+function fakeExecute(value) {
+	const fn = async () => value;
+	fn.label = "execute";
+	return fn;
+}
+
+async function rejectedExecute(reason) {
+	throw new Error(reason);
+}
+
+function recordCall(arr, payload) {
+	arr.push(payload);
+}
+
+function fakesWithDeps(extra = {}) {
+	const f = makeFakes();
+	// The default complete records the payload. A throwing variant records FIRST
+	// then throws, so completion-throws tests can still assert the attempted
+	// payload was the success completion (never ok:false).
+	const makeComplete = (shouldThrow) => async (payload) => {
+		recordCall(f.calls.complete, payload);
+		if (shouldThrow) throw new Error("completion store write failed");
+	};
+	const deps = {
+		execute: extra.execute ?? fakeExecute({ ok: true, delivered: "notify" }),
+		complete: makeComplete(extra.completeThrows === true),
+		reload: async () => {
+			f.calls.reload += 1;
+			if (extra.reloadThrows) throw new Error("reload store read failed");
+		},
+		isLive: extra.isLive ?? (() => true),
+		reportTaskFailure: (error, task) =>
+			recordCall(f.calls.reportTaskFailure, {
+				error: error?.message ?? String(error),
+				task,
+			}),
+		reportPersistenceFailure: (error, task, result) =>
+			recordCall(f.calls.reportPersistenceFailure, {
+				error: error?.message ?? String(error),
+				task,
+				result,
+			}),
+	};
+	return { f, deps };
+}
+
+const CLAIM = {
+	taskId: "t1",
+	runnerId: "owner",
+	claimToken: "tok",
+	claimGeneration: 3,
+};
+const TASK = { id: "t1", action: "notify", type: "once", message: "hi" };
+
+test("runClaimedExecution: success persists result and performs no live side effects when not live", async () => {
+	const { f, deps } = fakesWithDeps({
+		isLive: () => false,
+		execute: fakeExecute({ ok: true, delivered: "notify" }),
+	});
+	await runClaimedExecution(TASK, CLAIM, deps);
+	// The result is persisted regardless of liveness (durable completion).
+	assert.equal(f.calls.complete.length, 1);
+	assert.deepEqual(f.calls.complete[0], {
+		result: { ok: true, delivered: "notify" },
+		ok: true,
+	});
+	// Not live: no reload, no failure/persistence reports.
+	assert.equal(f.calls.reload, 0, "reload must be skipped when not live");
+	assert.equal(f.calls.reportTaskFailure.length, 0);
+	assert.equal(f.calls.reportPersistenceFailure.length, 0);
+});
+
+test("runClaimedExecution: execute rejection persists ok:false and performs no live side effects when not live", async () => {
+	const { f, deps } = fakesWithDeps({
+		isLive: () => false,
+		execute: async () => rejectedExecute("policy refused"),
+	});
+	await runClaimedExecution(TASK, CLAIM, deps);
+	assert.equal(f.calls.complete.length, 1);
+	assert.deepEqual(f.calls.complete[0], { result: undefined, ok: false });
+	// Not live: no live-session side effects even though execute rejected.
+	assert.equal(f.calls.reload, 0);
+	assert.equal(
+		f.calls.reportTaskFailure.length,
+		0,
+		"failure report is live-gated",
+	);
+	assert.equal(f.calls.reportPersistenceFailure.length, 0);
+});
+
+test("runClaimedExecution: success completion that throws is never followed by ok:false", async () => {
+	// A returned result whose completion THROWS must not be downgraded to a
+	// ok:false. Instead it reports a PERSISTENCE failure (if live) and leaves
+	// completion untouched.
+	const { f, deps } = fakesWithDeps({
+		isLive: () => true,
+		execute: fakeExecute({ ok: true, delivered: "notify" }),
+		completeThrows: true,
+	});
+	await runClaimedExecution(TASK, CLAIM, deps);
+	assert.equal(
+		f.calls.complete.length,
+		1,
+		"completion must be attempted exactly once",
+	);
+	assert.deepEqual(
+		f.calls.complete[0],
+		{ result: { ok: true, delivered: "notify" }, ok: true },
+		"only the success completion must be attempted; no ok:false downgrade",
+	);
+	assert.equal(
+		f.calls.reportPersistenceFailure.length,
+		1,
+		"a success-completion failure must report persistence failure (live)",
+	);
+	assert.equal(
+		f.calls.reportTaskFailure.length,
+		0,
+		"a success-completion failure must NOT be reported as a task failure",
+	);
+});
+
+test("runClaimedExecution: success completion throws when not live reports no task failure and no persistence report", async () => {
+	// Not live + success completion throws: persist failure is silent (no live
+	// session to report to), still no ok:false downgrade.
+	const { f, deps } = fakesWithDeps({
+		isLive: () => false,
+		execute: fakeExecute({ ok: true, delivered: "notify" }),
+		completeThrows: true,
+	});
+	await runClaimedExecution(TASK, CLAIM, deps);
+	assert.deepEqual(
+		f.calls.complete[0],
+		{ result: { ok: true, delivered: "notify" }, ok: true },
+		"no ok:false downgrade",
+	);
+	assert.equal(
+		f.calls.reportPersistenceFailure.length,
+		0,
+		"not live: no persistence report",
+	);
+	assert.equal(f.calls.reportTaskFailure.length, 0, "no task failure either");
+});
+
+test("runClaimedExecution: reload throws after durable success does not report task failure", async () => {
+	// Completion succeeds (durable), then reload THROWS. This must never emit a
+	// task-failed report/UI; reload is best-effort.
+	const { f, deps } = fakesWithDeps({
+		isLive: () => true,
+		execute: fakeExecute({ ok: true, delivered: "notify" }),
+		reloadThrows: true,
+	});
+	await runClaimedExecution(TASK, CLAIM, deps);
+	assert.equal(f.calls.complete.length, 1);
+	assert.equal(
+		f.calls.reportTaskFailure.length,
+		0,
+		"reload failure after durable success must not be reported as task failure",
+	);
+	assert.equal(f.calls.reportPersistenceFailure.length, 0);
+});
+
+test("runClaimedExecution: execute rejection always attempts ok:false even when not live", async () => {
+	// Regression: a rejection MUST persist ok:false regardless of liveness so
+	// lease recovery does not re-execute the task.
+	const { f, deps } = fakesWithDeps({
+		isLive: () => false,
+		execute: async () => rejectedExecute("exec boom"),
+	});
+	await runClaimedExecution(TASK, CLAIM, deps);
+	assert.deepEqual(f.calls.complete[0], { result: undefined, ok: false });
+	assert.equal(
+		f.calls.reportTaskFailure.length,
+		0,
+		"not live: no task failure report",
+	);
+});
+
+test("runClaimedExecution: execute rejection when live reports task failure and reloads", async () => {
+	const { f, deps } = fakesWithDeps({
+		isLive: () => true,
+		execute: async () => rejectedExecute("exec boom"),
+	});
+	await runClaimedExecution(TASK, CLAIM, deps);
+	assert.deepEqual(f.calls.complete[0], { result: undefined, ok: false });
+	assert.equal(
+		f.calls.reportTaskFailure.length,
+		1,
+		"live rejection reports task failure",
+	);
+	assert.equal(f.calls.reload, 1, "live rejection reloads after reporting");
+	assert.equal(f.calls.reportPersistenceFailure.length, 0);
+});
+
+test("runClaimedExecution: failed completion errors do not suppress the task failure report", async () => {
+	const { f, deps } = fakesWithDeps({
+		isLive: () => true,
+		execute: async () => rejectedExecute("exec boom"),
+		completeThrows: true,
+	});
+	await assert.doesNotReject(() => runClaimedExecution(TASK, CLAIM, deps));
+	assert.deepEqual(f.calls.complete, [{ result: undefined, ok: false }]);
+	assert.equal(f.calls.reload, 0, "reload requires durable completion");
+	assert.equal(f.calls.reportTaskFailure.length, 1);
+	assert.equal(
+		f.calls.reportPersistenceFailure.length,
+		1,
+		"failed-outcome persistence errors remain visible while live",
+	);
 });

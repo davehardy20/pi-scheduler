@@ -376,7 +376,9 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			clearTimeout(recoveryTimer);
 			recoveryTimer = undefined;
 		}
-		const delay = runtime.nextLeaseRecoveryDelay(tasks, new Date());
+		const delay = runtime.nextLeaseRecoveryDelay(tasks, new Date(), {
+			maxDelayMs: MAX_TIMER_DELAY_MS,
+		});
 		if (delay === null) return;
 		recoveryTimer = setTimeout(() => {
 			recoveryTimer = undefined;
@@ -690,50 +692,64 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		firing.add(task.id);
 		const claimToken = claimed.claimToken;
 		const claimGeneration = claimed.claimGeneration;
+		// Settle the claimed execution lifecycle through the injectable helper so
+		// the policy concerns (only executeTask rejection may persist ok:false;
+		// success/result completion failure is never downgraded; reload failure
+		// after durable success is never task-failed) stay cohesive and testable
+		// with fakes (HIGH fix 1 + MEDIUM fix 2). The helper owns completion,
+		// live-gated reload, and failure/persistence reports; index's finally
+		// keeps the unconditional firing.delete and live-only rescheduleAll.
 		try {
 			updateStatus(ctx);
-			const result = await executeTask(task, ctx);
-			// Persist the outcome even if shutdown occurred while the action was
-			// running. The action may already have produced external side effects;
-			// leaving its claim running would let lease recovery execute it again.
-			await taskStore.completeClaimedTask({
-				taskId: task.id,
-				runnerId,
-				claimToken,
-				claimGeneration,
-				result,
-				now: new Date(),
-				ok: result.ok !== false,
-			});
-			// Completion is durable, but post-shutdown sessions must not reload
-			// in-memory state or re-arm timers/UI work.
-			if (generation === sessionGeneration && !isShutdown) await reloadTasks();
-		} catch (error: any) {
-			try {
-				if (generation === sessionGeneration && !isShutdown) {
-					await taskStore.completeClaimedTask({
-						taskId: task.id,
-						runnerId,
-						claimToken,
-						claimGeneration,
-						now: new Date(),
-						ok: false,
-					});
-					await reloadTasks();
-				}
-			} catch {
-				// If completion fails (e.g. lease already expired and reclaimed),
-				// the store's lease recovery will handle it on a later tick.
-			}
-			const message = `Scheduled task ${task.id} failed: ${error?.message ?? String(error)}`;
-			if (ctx.hasUI) ctx.ui.notify(message, "error");
-			recordMessage(
-				`⚠️ ${message}`,
+			await runtime.runClaimedExecution(
+				task,
+				{ taskId: task.id, runnerId, claimToken, claimGeneration },
 				{
-					task: runtime.redactTaskForMessage(task),
-					error: error?.message ?? String(error),
+					execute: (t: ScheduledTask) => executeTask(t, ctx),
+					complete: async ({ result, ok }) => {
+						// Persist the outcome even if shutdown occurred while the
+						// action was running: the action may already have produced
+						// external side effects, and leaving its claim running would
+						// let lease recovery execute it again.
+						await taskStore.completeClaimedTask({
+							taskId: task.id,
+							runnerId,
+							claimToken,
+							claimGeneration,
+							result,
+							now: new Date(),
+							ok,
+						});
+					},
+					reload: () => reloadTasks(),
+					isLive: () => generation === sessionGeneration && !isShutdown,
+					reportTaskFailure: (error: any) => {
+						const message = `Scheduled task ${task.id} failed: ${error?.message ?? String(error)}`;
+						if (ctx.hasUI) ctx.ui.notify(message, "error");
+						recordMessage(
+							`⚠️ ${message}`,
+							{
+								task: runtime.redactTaskForMessage(task),
+								error: error?.message ?? String(error),
+							},
+							false,
+						);
+					},
+					reportPersistenceFailure: (error: any) => {
+						// A success/result completion error is a DURABILITY problem,
+						// not a task failure: never surface it as task-failed.
+						const message = `Scheduled task ${task.id} completed but could not be persisted: ${error?.message ?? String(error)}`;
+						if (ctx.hasUI) ctx.ui.notify(message, "warning");
+						recordMessage(
+							`⚠️ ${message}`,
+							{
+								task: runtime.redactTaskForMessage(task),
+								persistenceError: error?.message ?? String(error),
+							},
+							false,
+						);
+					},
 				},
-				false,
 			);
 		} finally {
 			firing.delete(task.id);
