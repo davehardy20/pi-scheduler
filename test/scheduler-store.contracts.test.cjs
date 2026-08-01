@@ -176,6 +176,15 @@ test("TaskStore module is importable", () => {
 	assert.equal(typeof store.createTaskStore, "function");
 });
 
+test("Windows rename permission codes are treated as potential lock contention", () => {
+	const { isPotentialLockContentionError } = loadStore();
+	assert.equal(isPotentialLockContentionError("EPERM", "win32"), true);
+	assert.equal(isPotentialLockContentionError("EACCES", "win32"), true);
+	assert.equal(isPotentialLockContentionError("EPERM", "linux"), false);
+	assert.equal(isPotentialLockContentionError("EEXIST", "linux"), true);
+	assert.equal(isPotentialLockContentionError("ENOTEMPTY", "win32"), true);
+});
+
 test("transaction serializes read-modify-write without lost updates across processes", async () => {
 	// Contract: two REAL concurrent child processes each increment a per-task
 	// counter by performing a full read-modify-write inside a store transaction.

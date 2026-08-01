@@ -6,6 +6,11 @@ const DEFAULT_LOCK_TIMEOUT_MS = 5000;
 const DEFAULT_STALE_LOCK_MS = 30000;
 const STATE_VERSION = 2;
 
+function isPotentialLockContentionError(code, platform = process.platform) {
+	if (code === "EEXIST" || code === "ENOTEMPTY") return true;
+	return platform === "win32" && (code === "EPERM" || code === "EACCES");
+}
+
 // Warn callback default: surfaced warnings are opt-in so a plain store does
 // not write to stderr. Callers (the runtime) pass onWarning to surface
 // malformed-state recovery to the user.
@@ -448,11 +453,13 @@ function createTaskStore(options = {}) {
 			);
 
 			while (true) {
+				let renameError;
 				try {
 					await fs.rename(candidateDir, lockDir);
 					return { token };
 				} catch (error) {
-					if (!["EEXIST", "ENOTEMPTY"].includes(error.code)) throw error;
+					if (!isPotentialLockContentionError(error.code)) throw error;
+					renameError = error;
 				}
 
 				const now = Date.now();
@@ -460,8 +467,17 @@ function createTaskStore(options = {}) {
 				try {
 					observed = await fingerprintLock(lockDir, now);
 				} catch (error) {
-					if (error.code === "ENOENT") continue;
+					if (error.code === "ENOENT") {
+						if (["EPERM", "EACCES"].includes(renameError.code))
+							throw renameError;
+						continue;
+					}
 					throw error;
+				}
+				// Windows EPERM/EACCES is contention only when the destination lock
+				// actually exists. Otherwise preserve the original permission failure.
+				if (!observed && ["EPERM", "EACCES"].includes(renameError.code)) {
+					throw renameError;
 				}
 
 				const age = observed ? now - observed.mtimeMs : 0;
@@ -908,4 +924,4 @@ function createTaskStore(options = {}) {
 	};
 }
 
-module.exports = { createTaskStore };
+module.exports = { createTaskStore, isPotentialLockContentionError };
