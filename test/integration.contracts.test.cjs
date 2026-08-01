@@ -650,3 +650,19 @@ test("index.ts wires fireTask execution settle through runClaimedExecution", () 
 		"fireTask must settle claimed execution through runtime.runClaimedExecution",
 	);
 });
+
+test("lease recovery refreshes persisted state before rearming an empty sweep", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const emptyBranch = source.match(
+		/if \(expired\.length === 0\) \{([\s\S]*?)\n\t\t\t\}/,
+	);
+	assert.ok(emptyBranch, "empty lease-recovery branch must exist");
+	assert.match(emptyBranch[1], /await reloadTasks\(\)/);
+	assert.match(emptyBranch[1], /rescheduleAll\(ctx\)/);
+	assert.match(
+		emptyBranch[1],
+		/await reloadTasks\(\);[\s\S]*if \(generation === sessionGeneration && !isShutdown\)[\s\S]*rescheduleAll\(ctx\)/,
+		"shutdown/generation must be re-checked after reload before rescheduling",
+	);
+	assert.doesNotMatch(emptyBranch[1], /armLeaseRecovery\(ctx\)/);
+});

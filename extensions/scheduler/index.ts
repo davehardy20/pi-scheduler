@@ -402,8 +402,15 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			);
 			const expired = runtime.tasksWithExpiredLeases(current, new Date());
 			if (expired.length === 0) {
-				if (generation === sessionGeneration && !isShutdown)
-					armLeaseRecovery(ctx);
+				if (generation === sessionGeneration && !isShutdown) {
+					// Another process may have completed/re-armed the task since this
+					// session loaded it. Refresh the in-memory mirror before rebuilding
+					// timers so stale running leases cannot create a recovery I/O loop
+					// or strand a recurring task that is now pending.
+					await reloadTasks();
+					if (generation === sessionGeneration && !isShutdown)
+						rescheduleAll(ctx);
+				}
 				return;
 			}
 			for (const task of expired) {
