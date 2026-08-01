@@ -433,7 +433,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			}
 			if (generation === sessionGeneration && !isShutdown) {
 				await reloadTasks();
-				rescheduleAll(ctx);
+				if (generation === sessionGeneration && !isShutdown) rescheduleAll(ctx);
 			}
 		} catch {
 			// A transient store/claim failure must not strand an expired lease.
@@ -446,7 +446,8 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				} catch {
 					// Keep the prior snapshot; it still identifies the running lease.
 				}
-				armLeaseRecovery(ctx);
+				if (generation === sessionGeneration && !isShutdown)
+					armLeaseRecovery(ctx);
 			}
 		}
 	}

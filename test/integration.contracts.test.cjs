@@ -666,3 +666,19 @@ test("lease recovery refreshes persisted state before rearming an empty sweep", 
 	);
 	assert.doesNotMatch(emptyBranch[1], /armLeaseRecovery\(ctx\)/);
 });
+
+test("all lease recovery paths re-check liveness after async reloads", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const recovery = source.slice(
+		source.indexOf("async function recoverExpiredLeases"),
+		source.indexOf("function recordMessage"),
+	);
+	assert.match(
+		recovery,
+		/for \(const task of expired\)[\s\S]*?await reloadTasks\(\);[\s\S]*?if \(generation === sessionGeneration && !isShutdown\)[\s\S]*?rescheduleAll\(ctx\)/,
+	);
+	assert.match(
+		recovery,
+		/catch \{[\s\S]*?await reloadTasks\(\);[\s\S]*?if \(generation === sessionGeneration && !isShutdown\)[\s\S]*?armLeaseRecovery\(ctx\)/,
+	);
+});
