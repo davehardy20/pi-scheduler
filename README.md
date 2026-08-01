@@ -325,19 +325,29 @@ argv starts with the entry's `argvPrefix`, and the firing `cwd` is contained
 beneath the entry's `cwdRoot`. Commands are validated **at scheduling time**
 and **revalidated immediately before firing**.
 
-Example policy (allow `npm test` and `npm run` beneath `/path/to/your/project`):
+Example policy (allow `npm test` beneath `/path/to/your/project`):
 
 ```json
 {
   "execution": {
     "enabled": true,
     "allow": [
-      { "executable": "npm", "argvPrefix": ["test"], "cwdRoot": "/path/to/your/project" },
-      { "executable": "npm", "argvPrefix": ["run"], "cwdRoot": "/path/to/your/project" }
+      { "executable": "npm", "argvPrefix": ["test"], "cwdRoot": "/path/to/your/project" }
     ]
   }
 }
 ```
+
+> **⚠️ `npm run` and other package-script entry points are arbitrary code.** An
+> allowlist entry like `{ "executable": "npm", "argvPrefix": ["run"] }` lets the
+> scheduler run **any** script defined in the repo's `package.json` — including
+> `pre*`/`post*` hooks and scripts added by dependencies — exactly as if you
+> had allowlisted a shell. Only allowlist package-script entry points for
+> **trusted repositories and specific script names** (for example
+> `{ "executable": "npm", "argvPrefix": ["run", "build"] }`), and prefer the
+> narrowest `argvPrefix` that does the job. The same caution applies to
+> `npx`, `yarn`, `pnpm`, and any launcher that delegates to repo-controlled
+> scripts.
 
 Structured shell task example:
 
@@ -365,20 +375,44 @@ only.
 Scheduled tasks are stored in a locked, cross-process task store at
 `~/.pi/agent/state/scheduler/tasks.json`. Every load/mutate/save runs inside a
 store transaction that serializes read-modify-write and reloads state while the
-lock is held, so concurrent Pi sessions cannot lose updates.
+lock is held, so concurrent Pi sessions cannot lose updates. The cross-process
+lock uses **crash-safe, ownership-safe stale recovery via a persistent owner
+tombstone**: a reclaimer that observes a stale (dead-owner) lock re-reads it
+and requires the exact observed owner/fingerprint, confirms the owner is dead,
+and then performs a SINGLE atomic `rename()` of the lock directory to a
+deterministic tombstone named after the observed owner token (or inode when the
+token is absent). Because that rename is the whole act, a reclaimer crash before
+it leaves the dead lock in place for the next reclaimer, and a crash after it
+leaves the lock directory free for a new owner while the tombstone is safely
+preserved — recovery is never permanently blocked. The tombstone is KEPT
+(never auto-deleted) and is non-empty, so a delayed reclaimer that already
+observed the same dead owner cannot `rename()` a new live owner's lock onto the
+existing tombstone (POSIX `rename()` of a non-empty directory over a non-empty
+directory fails with `ENOTEMPTY`). A bounded set of restrictive, owner-only
+(`0o700`) `*.tombstone-*` directories (one per distinct dead owner token, a
+256-bit random id) may accumulate next to the state file; these are stale,
+harmless artifacts that are never read for execution. You may remove old
+`*.tombstone-*` directories manually once you are certain no long-delayed
+reclaimer for that owner can still run — automatic deletion would reopen the
+delayed-reclaimer race.
 
 When a task is due, the runner that owns this Pi process atomically **claims**
 it with a stable, unique runner identity and a lease that covers the execution
 timeout with margin. **Only the claim owner executes and completes the task.**
 If the owning process crashes mid-run, the lease expires and a later runner
-recovers the claim automatically. A task claimed by a runner that should not
-execute it (for example, an out-of-scope task claimed by the wrong session) is
+recovers the claim automatically; the runtime also arms a bounded lease-expiry
+recovery sweep for persisted running tasks so a crashed owner is reclaimed
+after its lease expires. A task claimed by a runner that should not execute it
+(for example, an out-of-scope task claimed by the wrong session) is
 **abandoned**, not marked fired: its claim metadata is cleared and it is
 restored to pending without incrementing its run count, so a future eligible
 run can pick it up. If a one-shot timer fires but the store claim fails under
 contention, the scheduler retries the claim a bounded number of times and then
-re-arms the task so it is not stranded. Safe actions (`prompt`, `notify`,
-`message`) are unaffected and remain safe to schedule without any policy.
+re-arms the task (with a non-zero delay, never a busy-loop) so it is not
+stranded. Cancelling, disabling, or removing a task while a claim is running is
+respected by completion: the terminal/disabled state is never resurrected by a
+late completion. Safe actions (`prompt`, `notify`, `message`) are unaffected
+and remain safe to schedule without any policy.
 
 ## Bounded GitHub PR CI / Codex monitoring (prompt-based)
 

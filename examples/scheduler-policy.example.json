@@ -1,16 +1,11 @@
 {
-	"//": "Sample scheduler execution policy. Copy to ~/.pi/agent/state/scheduler/scheduler-policy.json and edit. Direct process execution is DENY-BY-DEFAULT: if this file is missing or malformed, every scheduled shell task fails closed. The policy is loaded FRESH for every scheduling and firing decision (it is NOT cached for the session), so an edit, chmod, or removal takes effect at the next decision without a restart. The file must be a regular file owned by the current user; on POSIX it must NOT be group- or world-writable (recommended mode 600, e.g. chmod 600 ~/.pi/agent/state/scheduler/scheduler-policy.json). Legacy command strings are never interpreted through a shell. Only structured { executable, argv } commands matching an allow entry run, invoked directly (no shell). An entry authorizes a command only when executable matches exactly, argv starts with argvPrefix, and the firing cwd is contained beneath cwdRoot. Commands are validated at scheduling time and revalidated immediately before firing. Keep GitHub/Git access out of this allowlist and route it through prompt-based monitoring with gh_safe / git_safe instead.",
+	"//": "Sample scheduler execution policy. Copy to ~/.pi/agent/state/scheduler/scheduler-policy.json and edit. Direct process execution is DENY BY DEFAULT: if this file is missing or malformed, every scheduled shell task fails closed. The policy is loaded FRESH for every scheduling and firing decision (it is NOT cached for the session), so an edit, chmod, or removal takes effect at the next decision without a restart. The file must be a regular file owned by the current user; on POSIX it must NOT be group- or world-writable (recommended mode 600, e.g. chmod 600 ~/.pi/agent/state/scheduler/scheduler-policy.json), and its parent directory must likewise be user-owned and not group/world-writable. Legacy command strings are never interpreted through a shell. Only structured { executable, argv } commands matching an allow entry run, invoked directly (no shell). An entry authorizes a command only when executable matches exactly, argv starts with argvPrefix, and the REALPATH-resolved firing cwd is contained beneath the REALPATH-resolved cwdRoot (both must be existing directories; symlink escapes are rejected). Commands are validated at scheduling time and revalidated immediately before firing. WARNING: package-script launchers (npm run, npx, yarn, pnpm) execute ARBITRARY repo-controlled code (including pre*/post* hooks and scripts added by dependencies) — only allowlist them for trusted repos and specific script names. Keep GitHub/Git access out of this allowlist and route it through prompt-based monitoring with gh_safe / git_safe instead.",
 	"execution": {
 		"enabled": true,
 		"allow": [
 			{
 				"executable": "npm",
 				"argvPrefix": ["test"],
-				"cwdRoot": "/path/to/your/project"
-			},
-			{
-				"executable": "npm",
-				"argvPrefix": ["run"],
 				"cwdRoot": "/path/to/your/project"
 			}
 		]

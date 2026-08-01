@@ -35,6 +35,17 @@ async function withTempDir(fn) {
 	}
 }
 
+// The policy now resolves cwdRoot/cwd via realpath and requires them to be
+// existing directories, so policy tests use real temp dirs.
+function withTempDirSync(fn) {
+	const dir = mkdtempSync(join(tmpdir(), "pi-scheduler-policy-int-"));
+	try {
+		return fn(dir);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 function dueTask(overrides = {}) {
 	const due = new Date(Date.now() - 1000).toISOString();
 	return {
@@ -122,44 +133,56 @@ test("malformed policy config fails closed", () => {
 // ---------------------------------------------------------------------------
 
 test("firing-time revalidation refuses a structured command whose argv drifted", () => {
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDirSync((repo) => {
+		const policy = createExecutionPolicy({
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+			},
+		});
+		// At scheduling the command was allowed...
+		assert.equal(
+			policy.decide({
+				task: {
+					action: "shell",
+					command: { executable: "npm", argv: ["test"] },
+				},
+				cwd: repo,
+			}).allowed,
+			true,
+		);
+		// ...but at fire time the persisted command was changed to a disallowed argv.
+		const redecide = policy.decide({
+			task: {
+				action: "shell",
+				command: { executable: "npm", argv: ["publish"] },
+			},
+			cwd: repo,
+		});
+		assert.equal(redecide.allowed, false);
 	});
-	// At scheduling the command was allowed...
-	assert.equal(
-		policy.decide({
-			task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-			cwd: "/repo",
-		}).allowed,
-		true,
-	);
-	// ...but at fire time the persisted command was changed to a disallowed argv.
-	const redecide = policy.decide({
-		task: {
-			action: "shell",
-			command: { executable: "npm", argv: ["publish"] },
-		},
-		cwd: "/repo",
-	});
-	assert.equal(redecide.allowed, false);
 });
 
 test("firing-time revalidation refuses when cwd has moved outside the allowlist root", () => {
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDirSync((repo) => {
+		withTempDirSync((elsewhere) => {
+			const policy = createExecutionPolicy({
+				execution: {
+					enabled: true,
+					allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+				},
+			});
+			const decision = policy.decide({
+				task: {
+					action: "shell",
+					command: { executable: "npm", argv: ["test"] },
+				},
+				cwd: elsewhere,
+			});
+			assert.equal(decision.allowed, false);
+			assert.match(decision.reason || "", /cwd|root|outside/i);
+		});
 	});
-	const decision = policy.decide({
-		task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-		cwd: "/etc",
-	});
-	assert.equal(decision.allowed, false);
-	assert.match(decision.reason || "", /cwd|root|outside/i);
 });
 
 // ---------------------------------------------------------------------------
@@ -169,27 +192,29 @@ test("firing-time revalidation refuses when cwd has moved outside the allowlist 
 // ---------------------------------------------------------------------------
 
 test("allowed structured command runs directly without a shell", () => {
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDirSync((repo) => {
+		const policy = createExecutionPolicy({
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+			},
+		});
+		const decision = policy.decide({
+			task: {
+				action: "shell",
+				command: { executable: "npm", argv: ["test", "--silent"] },
+			},
+			cwd: repo,
+		});
+		assert.equal(decision.allowed, true);
+		assert.equal(decision.shell, false, "execution must never invoke a shell");
+		assert.equal(decision.executable, "npm");
+		// The returned argv is the literal program + args, suitable for direct exec.
+		assert.deepEqual(decision.argv, ["npm", "test", "--silent"]);
+		// Sanity: the executable is never "bash" and no element is "-lc".
+		assert.notEqual(decision.executable, "bash");
+		assert.ok(!decision.argv.includes("-lc"), "must never pass -lc to a shell");
 	});
-	const decision = policy.decide({
-		task: {
-			action: "shell",
-			command: { executable: "npm", argv: ["test", "--silent"] },
-		},
-		cwd: "/repo",
-	});
-	assert.equal(decision.allowed, true);
-	assert.equal(decision.shell, false, "execution must never invoke a shell");
-	assert.equal(decision.executable, "npm");
-	// The returned argv is the literal program + args, suitable for direct exec.
-	assert.deepEqual(decision.argv, ["npm", "test", "--silent"]);
-	// Sanity: the executable is never "bash" and no element is "-lc".
-	assert.notEqual(decision.executable, "bash");
-	assert.ok(!decision.argv.includes("-lc"), "must never pass -lc to a shell");
 });
 
 test("legacy command string migration preserves text but never auto-executes", () => {
@@ -537,9 +562,7 @@ test("lifecycle recovery: policy revocation between scheduling and firing is hon
 			`${JSON.stringify({
 				execution: {
 					enabled: true,
-					allow: [
-						{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" },
-					],
+					allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: dir }],
 				},
 			})}\n`,
 			{ mode: 0o600 },
@@ -556,7 +579,7 @@ test("lifecycle recovery: policy revocation between scheduling and firing is hon
 				JSON.parse(readFileSync(policyFile, "utf8")),
 			).decide({
 				task,
-				cwd: "/repo",
+				cwd: dir,
 			}).allowed,
 			true,
 		);
@@ -572,7 +595,7 @@ test("lifecycle recovery: policy revocation between scheduling and firing is hon
 		const { loadPolicyFromFile } = require(join(ROOT, "execution-policy.cjs"));
 		const decision = loadPolicyFromFile(policyFile).decide({
 			task,
-			cwd: "/repo",
+			cwd: dir,
 		});
 		assert.equal(
 			decision.allowed,
