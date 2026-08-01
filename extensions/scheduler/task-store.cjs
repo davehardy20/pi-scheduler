@@ -218,6 +218,7 @@ function createTaskStore(options = {}) {
 		runnerId,
 		now = new Date(),
 		leaseMs = 60000,
+		taskId,
 	} = {}) {
 		if (!runnerId) throw new Error("runnerId is required");
 		const nowDate = toDate(now, "now");
@@ -236,6 +237,10 @@ function createTaskStore(options = {}) {
 					["fired", "cancelled", "failed"].includes(task.status)
 				)
 					continue;
+				// When a specific task id is requested (e.g. its in-process timer
+				// fired), only that task is eligible. Without an id, any due task
+				// may be claimed (used by recovery sweeps).
+				if (taskId !== undefined && task.id !== taskId) continue;
 				const claimExpiresMs = Date.parse(task.claimLeaseExpiresAt ?? "");
 				const hasLiveClaim =
 					task.status === "running" &&
@@ -330,7 +335,81 @@ function createTaskStore(options = {}) {
 		return completed;
 	}
 
-	return { transaction, claimDueTask, completeClaimedTask };
+	/**
+	 * Abandon a claim WITHOUT completing the task as fired/failed. Clears the
+	 * claim metadata (runnerId, claimToken, claimLeaseExpiresAt) and restores
+	 * the task to pending so a future eligible run can claim it again. The
+	 * runCount is NOT incremented: no execution happened.
+	 *
+	 * Ownership/token contract (same as completeClaimedTask): only the claim
+	 * owner may abandon its own claim. A runner that does not hold the claim
+	 * (wrong runnerId or wrong token) is rejected so it cannot release
+	 * another runner's claim. This is the safe counterpart to a no-op
+	 * release: the task stays pending, not fired.
+	 *
+	 * Used by the integration layer to release a claim for a task it must not
+	 * execute (e.g. an out-of-scope task) without falsely marking it fired.
+	 */
+	async function abandonClaimedTask({
+		taskId,
+		runnerId,
+		claimToken,
+		now = new Date(),
+	} = {}) {
+		if (!taskId) throw new Error("taskId is required");
+		if (!runnerId) throw new Error("runnerId is required");
+		if (!claimToken) throw new Error("claimToken is required");
+		const nowDate = toDate(now, "now");
+		let abandoned;
+
+		await transaction((tasks) => {
+			const task = tasks.find((item) => item && item.id === taskId);
+			if (!task) throw new Error(`Scheduled task not found: ${taskId}`);
+			if (task.runnerId !== String(runnerId))
+				throw new Error("Claim runner identity mismatch");
+			if (task.claimToken !== claimToken)
+				throw new Error("Claim token mismatch");
+
+			// Clear claim metadata so the lease is released and a later runner
+			// (or this one) can reclaim the task.
+			delete task.claimToken;
+			delete task.runnerId;
+			delete task.claimLeaseExpiresAt;
+
+			// Restore to pending. runCount is intentionally left untouched: no
+			// execution happened, so the task has not "run". The previous
+			// lastStatus ("running") is cleared so the UI does not show a stale
+			// running indicator for a task that will not execute now.
+			task.status = "pending";
+			task.enabled = true;
+			if (task.lastStatus === "running") delete task.lastStatus;
+
+			// For interval tasks, recompute the next run from now so the abandoned
+			// task does not fire again immediately on the same tick (which would
+			// re-enter the same out-of-scope release loop). A one-shot task keeps
+			// its dueAt/nextRun so the next eligible runner (e.g. an in-scope
+			// session) can pick it up; a cron task keeps its schedule and is
+			// re-armed on the next reschedule pass.
+			if (task.type === "interval") {
+				const intervalMs = Number(task.intervalMs);
+				if (Number.isFinite(intervalMs) && intervalMs > 0) {
+					const nextRun = new Date(
+						nowDate.getTime() + intervalMs,
+					).toISOString();
+					task.nextRun = nextRun;
+					task.dueAt = nextRun;
+				}
+			}
+			// cron/once keep their existing nextRun/dueAt (recomputed on the
+			// next claim or reschedule pass).
+
+			abandoned = { ...task };
+		});
+
+		return abandoned;
+	}
+
+	return { transaction, claimDueTask, completeClaimedTask, abandonClaimedTask };
 }
 
 module.exports = { createTaskStore };

@@ -16,6 +16,17 @@
 "use strict";
 
 const nodePath = require("node:path");
+const { lstatSync } = require("node:fs");
+
+// Fail-closed error reported when the policy file is missing or unreadable.
+// Distinct from an absent file (which is the normal deny-by-default state):
+// a path that exists but cannot be safely validated fails closed with a
+// reason that names the file so the user can fix it.
+//
+// POSIX file ownership/mode validation is enforced ONLY on POSIX platforms.
+// On Windows, fs.stat does not expose a meaningful uid/gid/mode, so mode
+// validation is skipped (Node never applies UNIX permission bits there
+// anyway). The policy still fails closed on a missing/unreadable file.
 
 // Actions that the policy considers safe to migrate and never marks for
 // auto-execution. These never reach `decide` because they are not process
@@ -361,8 +372,141 @@ function migrateTask(task) {
 	return migrated;
 }
 
+// `process.getuid`/`getgid` are absent on Windows. Guard so the POSIX checks
+// below are skipped there; Node never applies UNIX permission bits on
+// Windows regardless, so failing to check mode there is not a security gap.
+const HAS_POSIX_IDS = typeof process.getuid === "function";
+const IS_WIN32 = process.platform === "win32";
+
+// Any mode bit set in this mask is a write privilege granted to someone other
+// than the file owner. A policy file writable by group or world is an
+// unacceptable privilege boundary for an allowlist that authorizes direct
+// process execution, so such files are rejected and the policy fails closed.
+const NON_OWNER_WRITE_MASK = 0o022;
+
+/**
+ * Result of attempting to load and validate the policy file.
+ *
+ *   { ok: true,  config }            -> file present, validated, parsed
+ *   { ok: false, absent: true }      -> file does not exist (deny-by-default)
+ *   { ok: false, reason }            -> file present but unsafe/malformed
+ *
+ * This NEVER throws: callers treat any non-ok result as deny-by-default so a
+ * tampered or malformed policy file can never widen execution. A safe default
+ * is the only outcome of an unreadable/untrusted policy.
+ */
+function loadPolicyConfig(filePath) {
+	const path = asString(filePath);
+	if (!path) return { ok: false, absent: true };
+
+	let stat;
+	try {
+		// lstat (NOT stat) so a SYMLINK is detected as itself rather than
+		// transparently following it. A symlinked policy could point anywhere on
+		// the filesystem (outside the user-owned state directory), so it is
+		// rejected outright below as non-regular.
+		stat = lstatSync(path);
+	} catch (error) {
+		if (
+			error &&
+			(error.code === "ENOENT" || error.code === "MODULE_NOT_FOUND")
+		) {
+			return { ok: false, absent: true };
+		}
+		// Unreadable / permission denied / IO error: fail closed with a reason.
+		return {
+			ok: false,
+			reason: `Scheduled execution policy file is not readable (${path}): ${error?.code ? error.code : error?.message ? error.message : "unknown error"}. Execution is disabled.`,
+		};
+	}
+
+	// The policy file MUST be a regular file. lstatSync rejects symlinks (which
+	// could point outside the user-owned state directory) as well as sockets,
+	// devices, pipes, and directories. A non-regular file fails closed.
+	if (!stat.isFile()) {
+		return {
+			ok: false,
+			reason: `Scheduled execution policy file is not a regular file (${path}). Execution is disabled; remove or replace it with a regular file.`,
+		};
+	}
+
+	// POSIX ownership and mode validation. Skipped on Windows where Node does
+	// not expose a meaningful uid/gid and never applies UNIX permission bits.
+	if (!IS_WIN32 && HAS_POSIX_IDS) {
+		const ownerUid = process.getuid();
+
+		// The file MUST be owned by the current (real) user. A policy owned by
+		// root or another account could be altered by a shared-service user and
+		// is not a trustworthy privilege boundary for direct execution.
+		if (typeof stat.uid === "number" && stat.uid !== ownerUid) {
+			return {
+				ok: false,
+				reason: `Scheduled execution policy file is not owned by the current user (uid ${stat.uid}, expected ${ownerUid}) at ${path}. Execution is disabled; run 'chown "$USER" "${path}"' and 'chmod 600 "${path}"'.`,
+			};
+		}
+
+		// Reject group- or world-writable files outright. Anyone with group or
+		// world write could edit the allowlist to authorize arbitrary direct
+		// execution. Recommend chmod 600 in the actionable reason.
+		const mode = stat.mode & 0o777;
+		if ((mode & NON_OWNER_WRITE_MASK) !== 0) {
+			return {
+				ok: false,
+				reason: `Scheduled execution policy file is group- or world-writable (mode 0o${mode.toString(8).padStart(3, "0")}) at ${path}. Execution is disabled; run 'chmod 600 "${path}"'.`,
+			};
+		}
+	}
+
+	// Read and parse JSON. A syntax error fails closed rather than widening.
+	let config;
+	try {
+		// Inline require is avoided deliberately: require caches in
+		// require.cache and would defeat per-decision freshness. Read the bytes
+		// and JSON.parse every time so a revoked/edited policy is honored.
+		const raw = require("node:fs").readFileSync(path, "utf8");
+		config = JSON.parse(raw);
+	} catch (error) {
+		return {
+			ok: false,
+			reason: `Scheduled execution policy file is malformed JSON (${path}): ${error?.message ? error.message : "parse error"}. Execution is disabled.`,
+		};
+	}
+
+	return { ok: true, config };
+}
+
+/**
+ * Load the execution policy FRESH from disk for a single scheduling/firing
+ * decision. Nothing is cached: every call re-reads, re-validates ownership/
+ * mode, and re-parses the file so a policy revocation or edit takes effect at
+ * the next decision without a restart.
+ *
+ * A missing file is the normal deny-by-default state (returns a deny policy
+ * with the standard absent-config reason). A file that exists but is
+ * unsafe (non-regular, not user-owned, group/world-writable, or malformed)
+ * fails closed with an actionable reason that names the file.
+ *
+ * @param {string} filePath
+ * @returns {{ decide: (ctx: { task: object, cwd?: string }) => object }}
+ */
+function loadPolicyFromFile(filePath) {
+	const loaded = loadPolicyConfig(filePath);
+	if (!loaded.ok) {
+		if (loaded.absent) return createExecutionPolicy();
+		const reason = loaded.reason;
+		return {
+			decide() {
+				return deny(reason);
+			},
+		};
+	}
+	return createExecutionPolicy(loaded.config);
+}
+
 module.exports = {
 	createExecutionPolicy,
+	loadPolicyFromFile,
+	loadPolicyConfig,
 	migrateTask,
 	// Exported for targeted unit testing / reuse.
 	normalizePath,
