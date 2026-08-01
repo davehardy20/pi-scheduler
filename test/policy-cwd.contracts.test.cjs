@@ -33,7 +33,12 @@ const POLICY_PATH = join(
 	"scheduler",
 	"execution-policy.cjs",
 );
-const { createExecutionPolicy } = require(POLICY_PATH);
+const {
+	createExecutionPolicy,
+	isAbsoluteConfiguredPath,
+	isPathWithin,
+	normalizeAllowEntry,
+} = require(POLICY_PATH);
 
 function withTempDir(fn) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-scheduler-cwd-"));
@@ -211,4 +216,21 @@ test("the verified real cwd is returned on an allow", () => {
 		// decision.cwd is the realpath-resolved absolute directory.
 		assert.equal(decision.cwd, require("node:fs").realpathSync(root));
 	});
+});
+
+test("Windows drive roots are absolute and use native containment semantics", () => {
+	const root = "C:\\repo";
+	const nested = "C:\\repo\\subdir";
+
+	assert.equal(isAbsoluteConfiguredPath(root, "win32"), true);
+	assert.equal(isPathWithin(nested, root, "win32"), true);
+	assert.equal(isPathWithin("C:\\repository", root, "win32"), false);
+
+	assert.deepEqual(
+		normalizeAllowEntry(
+			{ executable: "npm", argvPrefix: ["test"], cwdRoot: root },
+			"win32",
+		),
+		{ executable: "npm", argvPrefix: ["test"], cwdRoot: root },
+	);
 });

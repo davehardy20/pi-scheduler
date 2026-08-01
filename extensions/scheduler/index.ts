@@ -693,8 +693,9 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		try {
 			updateStatus(ctx);
 			const result = await executeTask(task, ctx);
-			// Refuse to complete/reschedule if the session ended during execution.
-			if (generation !== sessionGeneration || isShutdown) return;
+			// Persist the outcome even if shutdown occurred while the action was
+			// running. The action may already have produced external side effects;
+			// leaving its claim running would let lease recovery execute it again.
 			await taskStore.completeClaimedTask({
 				taskId: task.id,
 				runnerId,
@@ -704,7 +705,9 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				now: new Date(),
 				ok: result.ok !== false,
 			});
-			await reloadTasks();
+			// Completion is durable, but post-shutdown sessions must not reload
+			// in-memory state or re-arm timers/UI work.
+			if (generation === sessionGeneration && !isShutdown) await reloadTasks();
 		} catch (error: any) {
 			try {
 				if (generation === sessionGeneration && !isShutdown) {

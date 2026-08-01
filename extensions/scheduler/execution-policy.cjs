@@ -90,16 +90,36 @@ function resolveDirectory(value) {
 	}
 }
 
-/** Both inputs
- * must already be normalized absolute paths. Containment treats the parent as
- * a directory boundary, so "/repo" contains "/repo" and "/repo/sub" but NOT
- * "/repository".
+/**
+ * Select native path semantics for the target platform. The optional platform
+ * argument keeps Windows behavior testable from non-Windows development hosts.
  */
-function isPathWithin(child, parent) {
+function pathApiForPlatform(platform = process.platform) {
+	return platform === "win32" ? nodePath.win32 : nodePath.posix;
+}
+
+/** Return whether a configured root is absolute for the target platform. */
+function isAbsoluteConfiguredPath(value, platform = process.platform) {
+	const raw = asString(value).trim();
+	if (!raw) return false;
+	return pathApiForPlatform(platform).isAbsolute(raw);
+}
+
+/**
+ * Both inputs must already be normalized absolute paths. Native relative-path
+ * semantics preserve Windows drive/UNC handling and enforce directory boundaries
+ * on every platform.
+ */
+function isPathWithin(child, parent, platform = process.platform) {
 	if (!child || !parent) return false;
-	if (child === parent) return true;
-	const prefix = parent.endsWith("/") ? parent : `${parent}/`;
-	return child.startsWith(prefix);
+	const pathApi = pathApiForPlatform(platform);
+	const relative = pathApi.relative(parent, child);
+	return (
+		relative === "" ||
+		(relative !== ".." &&
+			!relative.startsWith(`..${pathApi.sep}`) &&
+			!pathApi.isAbsolute(relative))
+	);
 }
 
 /**
@@ -138,7 +158,7 @@ function isValidArgv(value) {
  * malformed (the policy fails closed on any malformed entry by dropping it
  * from consideration; if that leaves no entries, execution is denied).
  */
-function normalizeAllowEntry(entry) {
+function normalizeAllowEntry(entry, platform = process.platform) {
 	if (!entry || typeof entry !== "object") return null;
 
 	if (!isValidExecutable(entry.executable)) return null;
@@ -158,13 +178,12 @@ function normalizeAllowEntry(entry) {
 	// containment are validated at decision time (fail closed) so a revoked
 	// or moved root is honored immediately.
 	const cwdRootRaw = asString(entry.cwdRoot).trim();
-	if (!cwdRootRaw) return null;
-	if (!nodePath.posix.isAbsolute(cwdRootRaw.replace(/\\/g, "/"))) return null;
+	if (!isAbsoluteConfiguredPath(cwdRootRaw, platform)) return null;
 
 	return {
 		executable,
 		argvPrefix: argvPrefix.slice(),
-		cwdRoot: cwdRootRaw.replace(/\\/g, "/"),
+		cwdRoot: cwdRootRaw,
 	};
 }
 
@@ -618,6 +637,7 @@ module.exports = {
 	migrateTask,
 	// Exported for targeted unit testing / reuse.
 	normalizePath,
+	isAbsoluteConfiguredPath,
 	isPathWithin,
 	isValidExecutable,
 	isValidArgv,

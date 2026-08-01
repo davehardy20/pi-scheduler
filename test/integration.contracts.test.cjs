@@ -636,3 +636,25 @@ test("lifecycle recovery: a group-writable policy file fails closed at fire time
 		assert.match(decision.reason || "", /group|world|writable|chmod|600/i);
 	});
 });
+
+test("completed side effects are persisted even when shutdown occurs during execution", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const execution = source.indexOf(
+		"const result = await executeTask(task, ctx);",
+	);
+	const completion = source.indexOf(
+		"await taskStore.completeClaimedTask({",
+		execution,
+	);
+
+	assert.ok(execution >= 0, "fireTask execution wiring must exist");
+	assert.ok(
+		completion > execution,
+		"execution must be followed by persistence",
+	);
+	assert.doesNotMatch(
+		source.slice(execution, completion),
+		/if\s*\(\s*generation\s*!==\s*sessionGeneration\s*\|\|\s*isShutdown\s*\)\s*return/,
+		"shutdown after executeTask must not skip persisted completion",
+	);
+});
