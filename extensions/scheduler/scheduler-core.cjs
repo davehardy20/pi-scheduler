@@ -5,7 +5,10 @@ function loadCroner() {
 	try {
 		return require("croner");
 	} catch (error) {
-		if (error?.code !== "MODULE_NOT_FOUND" || !String(error?.message ?? "").includes("'croner'")) {
+		if (
+			error?.code !== "MODULE_NOT_FOUND" ||
+			!String(error?.message ?? "").includes("'croner'")
+		) {
 			throw error;
 		}
 		// Pi's extension loader can preserve the npm/pnpm package symlink path. In that
@@ -19,7 +22,13 @@ const { Cron } = loadCroner();
 
 const VALID_ACTIONS = new Set(["notify", "prompt", "shell", "message"]);
 const VALID_TYPES = new Set(["once", "interval", "cron"]);
-const VALID_STATUSES = new Set(["pending", "running", "fired", "cancelled", "failed"]);
+const VALID_STATUSES = new Set([
+	"pending",
+	"running",
+	"fired",
+	"cancelled",
+	"failed",
+]);
 const VALID_LAST_STATUSES = new Set(["success", "error", "running"]);
 const VALID_SCOPES = new Set(["session", "cwd", "global"]);
 const VALID_WAKE_ON = new Set(["always", "failure", "success", "never"]);
@@ -31,13 +40,16 @@ const DAY = 24 * HOUR;
 const WEEK = 7 * DAY;
 
 function asDate(value) {
-	const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+	const date =
+		value instanceof Date ? new Date(value.getTime()) : new Date(value);
 	if (Number.isNaN(date.getTime())) throw new Error(`Invalid date: ${value}`);
 	return date;
 }
 
 function compactSpaces(text) {
-	return String(text ?? "").trim().replace(/\s+/g, " ");
+	return String(text ?? "")
+		.trim()
+		.replace(/\s+/g, " ");
 }
 
 function unitToMs(unit) {
@@ -63,13 +75,14 @@ function parseDurationMs(text) {
 		.trim();
 	if (!input) return null;
 
-	const re = /(\d+(?:\.\d+)?)\s*(weeks?|w|days?|d|hours?|hrs?|hr|h|minutes?|mins?|min|m|seconds?|secs?|sec|s)/gi;
+	const re =
+		/(\d+(?:\.\d+)?)\s*(weeks?|w|days?|d|hours?|hrs?|hr|h|minutes?|mins?|min|m|seconds?|secs?|sec|s)/gi;
 	let total = 0;
 	let matched = false;
 	let cursor = 0;
-	let match;
+	let match = re.exec(input);
 
-	while ((match = re.exec(input)) !== null) {
+	while (match !== null) {
 		const between = input.slice(cursor, match.index);
 		if (between.trim() !== "") return null;
 		const value = Number(match[1]);
@@ -78,6 +91,7 @@ function parseDurationMs(text) {
 		total += value * unitMs;
 		matched = true;
 		cursor = re.lastIndex;
+		match = re.exec(input);
 	}
 
 	if (!matched || input.slice(cursor).trim() !== "") return null;
@@ -132,14 +146,17 @@ function parseClockExpression(text, now) {
 	}
 
 	if (!input) return null;
-	const parsed = parseTimeToken(input, { allowBareHour: hadAt || dayOffset !== undefined });
+	const parsed = parseTimeToken(input, {
+		allowBareHour: hadAt || dayOffset !== undefined,
+	});
 	if (!parsed) return null;
 
 	const target = new Date(now.getTime());
 	if (dayOffset !== undefined) target.setDate(target.getDate() + dayOffset);
 	target.setHours(parsed.hour, parsed.minute, 0, 0);
 
-	if (dayOffset === undefined && target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+	if (dayOffset === undefined && target.getTime() <= now.getTime())
+		target.setDate(target.getDate() + 1);
 	return target.getTime();
 }
 
@@ -150,18 +167,24 @@ function parseWhen(text, nowValue = new Date()) {
 
 	const durationMs = parseDurationMs(input);
 	if (durationMs !== null) {
-		return { dueAtMs: now.getTime() + durationMs, kind: "relative", normalized: input };
+		return {
+			dueAtMs: now.getTime() + durationMs,
+			kind: "relative",
+			normalized: input,
+		};
 	}
 
 	const clockMs = parseClockExpression(input, now);
 	if (clockMs !== null) {
-		if (clockMs <= now.getTime()) throw new Error(`Scheduled time is in the past: ${input}`);
+		if (clockMs <= now.getTime())
+			throw new Error(`Scheduled time is in the past: ${input}`);
 		return { dueAtMs: clockMs, kind: "clock", normalized: input };
 	}
 
 	const absoluteMs = Date.parse(input);
 	if (!Number.isNaN(absoluteMs)) {
-		if (absoluteMs <= now.getTime()) throw new Error(`Scheduled time is in the past: ${input}`);
+		if (absoluteMs <= now.getTime())
+			throw new Error(`Scheduled time is in the past: ${input}`);
 		return { dueAtMs: absoluteMs, kind: "absolute", normalized: input };
 	}
 
@@ -170,39 +193,47 @@ function parseWhen(text, nowValue = new Date()) {
 
 function normalizeAction(action) {
 	const value = compactSpaces(action || "notify").toLowerCase();
-	if (!VALID_ACTIONS.has(value)) throw new Error(`Invalid scheduled action: ${value}`);
+	if (!VALID_ACTIONS.has(value))
+		throw new Error(`Invalid scheduled action: ${value}`);
 	return value;
 }
 
 function normalizeType(type) {
 	const value = compactSpaces(type || "once").toLowerCase();
-	if (!VALID_TYPES.has(value)) throw new Error(`Invalid schedule type: ${value}`);
+	if (!VALID_TYPES.has(value))
+		throw new Error(`Invalid schedule type: ${value}`);
 	return value;
 }
 
 function normalizeScope(scope) {
 	const value = compactSpaces(scope || "session").toLowerCase();
-	if (!VALID_SCOPES.has(value)) throw new Error(`Invalid scheduled task scope: ${value}`);
+	if (!VALID_SCOPES.has(value))
+		throw new Error(`Invalid scheduled task scope: ${value}`);
 	return value;
 }
 
 function normalizeWakeOn(wakeOn, hasPrompt = false) {
-	const value = compactSpaces(wakeOn || (hasPrompt ? "always" : "never")).toLowerCase();
-	if (!VALID_WAKE_ON.has(value)) throw new Error(`Invalid wakeOn value: ${value}`);
+	const value = compactSpaces(
+		wakeOn || (hasPrompt ? "always" : "never"),
+	).toLowerCase();
+	if (!VALID_WAKE_ON.has(value))
+		throw new Error(`Invalid wakeOn value: ${value}`);
 	return value;
 }
 
 function normalizeMaxRuns(value) {
 	if (value === undefined || value === null || value === "") return undefined;
 	const n = Number(value);
-	if (!Number.isInteger(n) || n <= 0) throw new Error("maxRuns must be a positive integer");
+	if (!Number.isInteger(n) || n <= 0)
+		throw new Error("maxRuns must be a positive integer");
 	return n;
 }
 
 function validateTimeoutMs(value) {
 	if (value === undefined || value === null) return undefined;
 	const n = Number(value);
-	if (!Number.isFinite(n) || n <= 0) throw new Error("timeoutMs must be a positive number");
+	if (!Number.isFinite(n) || n <= 0)
+		throw new Error("timeoutMs must be a positive number");
 	return Math.round(n);
 }
 
@@ -215,7 +246,14 @@ function validateTaskSchedule(typeValue, scheduleValue, nowValue = new Date()) {
 	if (type === "once") {
 		const parsed = parseWhen(schedule, now);
 		const nextRun = new Date(parsed.dueAtMs).toISOString();
-		return { type, schedule, nextRun, dueAt: nextRun, dueAtMs: parsed.dueAtMs, scheduleKind: parsed.kind };
+		return {
+			type,
+			schedule,
+			nextRun,
+			dueAt: nextRun,
+			dueAtMs: parsed.dueAtMs,
+			scheduleKind: parsed.kind,
+		};
 	}
 
 	if (type === "interval") {
@@ -230,24 +268,37 @@ function validateTaskSchedule(typeValue, scheduleValue, nowValue = new Date()) {
 		const next = cron.nextRun(now);
 		cron.stop();
 		if (!next) throw new Error("No next run could be computed");
-		return { type, schedule, nextRun: next.toISOString(), dueAt: next.toISOString() };
+		return {
+			type,
+			schedule,
+			nextRun: next.toISOString(),
+			dueAt: next.toISOString(),
+		};
 	} catch (error) {
-		throw new Error(`Invalid cron schedule: ${schedule}${error instanceof Error ? ` (${error.message})` : ""}`);
+		throw new Error(
+			`Invalid cron schedule: ${schedule}${error instanceof Error ? ` (${error.message})` : ""}`,
+		);
 	}
 }
 
 function getScheduleInput(input) {
-	return compactSpaces(input.schedule ?? input.whenText ?? input.when ?? input.due ?? "");
+	return compactSpaces(
+		input.schedule ?? input.whenText ?? input.when ?? input.due ?? "",
+	);
 }
 
 function splitScheduleCommand(args, nowValue = new Date()) {
 	const text = compactSpaces(args);
-	if (!text) throw new Error("Usage: /schedule [notify|prompt|shell|message] <when> <payload>");
+	if (!text)
+		throw new Error(
+			"Usage: /schedule [notify|prompt|shell|message] <when> <payload>",
+		);
 
 	const parseLeft = (leftText) => {
 		const tokens = compactSpaces(leftText).split(" ").filter(Boolean);
 		let action = "notify";
-		if (tokens.length > 0 && VALID_ACTIONS.has(tokens[0].toLowerCase())) action = tokens.shift().toLowerCase();
+		if (tokens.length > 0 && VALID_ACTIONS.has(tokens[0].toLowerCase()))
+			action = tokens.shift().toLowerCase();
 
 		let type = "once";
 		if (tokens[0]?.toLowerCase() === "every") {
@@ -266,7 +317,10 @@ function splitScheduleCommand(args, nowValue = new Date()) {
 	if (separatorIndex >= 0) {
 		const left = compactSpaces(text.slice(0, separatorIndex));
 		const payload = compactSpaces(text.slice(separatorIndex + 2));
-		if (!left || !payload) throw new Error("Usage with separator: /schedule [action] <when> :: <payload>");
+		if (!left || !payload)
+			throw new Error(
+				"Usage with separator: /schedule [action] <when> :: <payload>",
+			);
 		return { ...parseLeft(left), payload };
 	}
 
@@ -286,19 +340,62 @@ function splitScheduleCommand(args, nowValue = new Date()) {
 		if (!payload) continue;
 		try {
 			validateTaskSchedule("once", schedule, nowValue);
-			bestMatch = { action, type: "once", schedule, whenText: schedule, payload };
+			bestMatch = {
+				action,
+				type: "once",
+				schedule,
+				whenText: schedule,
+				payload,
+			};
 		} catch {
 			// Try a longer prefix.
 		}
 	}
 	if (bestMatch) return bestMatch;
 
-	throw new Error("Could not split scheduled task. Try: /schedule prompt 5m summarize progress");
+	throw new Error(
+		"Could not split scheduled task. Try: /schedule prompt 5m summarize progress",
+	);
 }
 
 function generateId(nowValue = new Date()) {
 	const now = asDate(nowValue);
 	return `task_${now.getTime().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Coerce a scheduled `command` value into the form the rest of the scheduler
+// expects. Shell commands are structured: { executable, argv }. A legacy
+// command STRING is accepted here for display/back-compat but never executed
+// (the execution policy fails closed on strings). Structured objects are
+// validated minimally and passed through verbatim so create/update-time policy
+// validation (in index.ts) can authorize them; malformed structured shapes
+// throw so callers learn immediately. Returns the coerced command value
+// (a trimmed string, a normalized structured object, or undefined).
+function coerceCommand(value) {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value === "string") return compactSpaces(value);
+	if (typeof value !== "object")
+		throw new Error(
+			"command must be a string or a structured { executable, argv } object",
+		);
+	const executable = value.executable;
+	const argv = value.argv;
+	if (typeof executable !== "string" || !executable.trim())
+		throw new Error(
+			"structured command requires a non-empty executable string",
+		);
+	if (argv !== undefined && argv !== null) {
+		if (!Array.isArray(argv))
+			throw new Error("structured command argv must be an array");
+		for (const element of argv) {
+			if (typeof element !== "string" || element.includes("\u0000"))
+				throw new Error("structured command argv must be an array of strings");
+		}
+	}
+	return {
+		executable: executable.trim(),
+		argv: Array.isArray(argv) ? argv.slice() : [],
+	};
 }
 
 function createScheduledTask(input, nowValue = new Date(), idFn = generateId) {
@@ -308,7 +405,9 @@ function createScheduledTask(input, nowValue = new Date(), idFn = generateId) {
 	const schedule = getScheduleInput(input);
 	const validated = validateTaskSchedule(type, schedule, now);
 	const enabled = input.enabled === undefined ? true : Boolean(input.enabled);
-	const hasShellPrompt = Boolean(input.followUpPrompt || input.successPrompt || input.failurePrompt);
+	const hasShellPrompt = Boolean(
+		input.followUpPrompt || input.successPrompt || input.failurePrompt,
+	);
 
 	const task = {
 		id: idFn(now),
@@ -325,26 +424,34 @@ function createScheduledTask(input, nowValue = new Date(), idFn = generateId) {
 		scope: normalizeScope(input.scope),
 	};
 
-	if (validated.intervalMs !== undefined) task.intervalMs = validated.intervalMs;
+	if (validated.intervalMs !== undefined)
+		task.intervalMs = validated.intervalMs;
 	if (input.title !== undefined) task.title = compactSpaces(input.title);
 	if (input.name !== undefined) task.name = compactSpaces(input.name);
-	if (input.description !== undefined) task.description = compactSpaces(input.description);
+	if (input.description !== undefined)
+		task.description = compactSpaces(input.description);
 	if (input.cwd) task.cwd = String(input.cwd);
 	if (input.sessionFile) task.sessionFile = String(input.sessionFile);
-	if (input.maxRuns !== undefined) task.maxRuns = normalizeMaxRuns(input.maxRuns);
+	if (input.maxRuns !== undefined)
+		task.maxRuns = normalizeMaxRuns(input.maxRuns);
 
 	const message = compactSpaces(input.message ?? input.payload ?? "");
-	const prompt = compactSpaces(input.prompt ?? input.payload ?? input.message ?? "");
-	const command = compactSpaces(input.command ?? input.payload ?? "");
+	const prompt = compactSpaces(
+		input.prompt ?? input.payload ?? input.message ?? "",
+	);
+	const command = coerceCommand(input.command ?? input.payload ?? "");
 
 	if (action === "notify") {
-		if (!message) throw new Error("message is required for notify scheduled tasks");
+		if (!message)
+			throw new Error("message is required for notify scheduled tasks");
 		task.message = message;
 	} else if (action === "prompt") {
-		if (!prompt) throw new Error("prompt is required for prompt scheduled tasks");
+		if (!prompt)
+			throw new Error("prompt is required for prompt scheduled tasks");
 		task.prompt = prompt;
 	} else if (action === "shell") {
-		if (!command) throw new Error("command is required for shell scheduled tasks");
+		if (!command || command === "")
+			throw new Error("command is required for shell scheduled tasks");
 		task.command = command;
 		const timeoutMs = validateTimeoutMs(input.timeoutMs);
 		if (timeoutMs !== undefined) task.timeoutMs = timeoutMs;
@@ -356,9 +463,11 @@ function createScheduledTask(input, nowValue = new Date(), idFn = generateId) {
 		if (failurePrompt) task.failurePrompt = failurePrompt;
 		task.wakeOn = normalizeWakeOn(input.wakeOn, hasShellPrompt);
 	} else if (action === "message") {
-		if (!message) throw new Error("message is required for message scheduled tasks");
+		if (!message)
+			throw new Error("message is required for message scheduled tasks");
 		task.message = message;
-		if (input.triggerTurn !== undefined) task.triggerTurn = Boolean(input.triggerTurn);
+		if (input.triggerTurn !== undefined)
+			task.triggerTurn = Boolean(input.triggerTurn);
 	}
 
 	return task;
@@ -370,7 +479,11 @@ function taskSummary(task) {
 }
 
 function isTerminal(task) {
-	return task.status === "fired" || task.status === "cancelled" || task.status === "failed";
+	return (
+		task.status === "fired" ||
+		task.status === "cancelled" ||
+		task.status === "failed"
+	);
 }
 
 function normalizeTask(task, nowValue = new Date()) {
@@ -391,21 +504,33 @@ function normalizeTask(task, nowValue = new Date()) {
 		type = "once";
 	}
 
-	const schedule = compactSpaces(task.schedule ?? task.whenText ?? task.when ?? task.due ?? task.dueAt ?? "");
+	const schedule = compactSpaces(
+		task.schedule ?? task.whenText ?? task.when ?? task.due ?? task.dueAt ?? "",
+	);
 	if (!schedule) return undefined;
 
 	const migrated = { ...task, action, type, schedule, status };
-	migrated.enabled = task.enabled === undefined ? !isTerminal(migrated) : Boolean(task.enabled);
-	migrated.runCount = Number.isInteger(task.runCount) && task.runCount >= 0 ? task.runCount : 0;
+	migrated.enabled =
+		task.enabled === undefined ? !isTerminal(migrated) : Boolean(task.enabled);
+	migrated.runCount =
+		Number.isInteger(task.runCount) && task.runCount >= 0 ? task.runCount : 0;
 	migrated.scope = VALID_SCOPES.has(task.scope) ? task.scope : "session";
 	migrated.whenText = compactSpaces(task.whenText ?? task.when ?? schedule);
-	migrated.createdAt = Number.isNaN(Date.parse(task.createdAt)) ? asDate(nowValue).toISOString() : task.createdAt;
-	if (task.maxRuns !== undefined) migrated.maxRuns = normalizeMaxRuns(task.maxRuns);
-	if (task.lastStatus !== undefined && !VALID_LAST_STATUSES.has(task.lastStatus)) delete migrated.lastStatus;
+	migrated.createdAt = Number.isNaN(Date.parse(task.createdAt))
+		? asDate(nowValue).toISOString()
+		: task.createdAt;
+	if (task.maxRuns !== undefined)
+		migrated.maxRuns = normalizeMaxRuns(task.maxRuns);
+	if (
+		task.lastStatus !== undefined &&
+		!VALID_LAST_STATUSES.has(task.lastStatus)
+	)
+		delete migrated.lastStatus;
 
 	try {
 		const validated = validateTaskSchedule(type, schedule, nowValue);
-		if (validated.intervalMs !== undefined) migrated.intervalMs = validated.intervalMs;
+		if (validated.intervalMs !== undefined)
+			migrated.intervalMs = validated.intervalMs;
 		if (!task.nextRun && !task.dueAt) {
 			migrated.nextRun = migrated.enabled ? validated.nextRun : undefined;
 			migrated.dueAt = validated.dueAt;
@@ -413,17 +538,23 @@ function normalizeTask(task, nowValue = new Date()) {
 	} catch {
 		// Legacy one-shot absolute dueAt values may be in the past. Keep them for
 		// display/missed-run handling instead of dropping the task.
-		if (type !== "once" || Number.isNaN(Date.parse(task.dueAt ?? task.nextRun))) return undefined;
+		if (type !== "once" || Number.isNaN(Date.parse(task.dueAt ?? task.nextRun)))
+			return undefined;
 	}
 
 	const preservedNext = task.nextRun ?? task.dueAt;
 	if (preservedNext && !Number.isNaN(Date.parse(preservedNext))) {
-		migrated.nextRun = migrated.enabled && !isTerminal(migrated) ? new Date(preservedNext).toISOString() : undefined;
+		migrated.nextRun =
+			migrated.enabled && !isTerminal(migrated)
+				? new Date(preservedNext).toISOString()
+				: undefined;
 		migrated.dueAt = new Date(preservedNext).toISOString();
 	}
 
 	if (action === "shell") {
-		const hasShellPrompt = Boolean(task.followUpPrompt || task.successPrompt || task.failurePrompt);
+		const hasShellPrompt = Boolean(
+			task.followUpPrompt || task.successPrompt || task.failurePrompt,
+		);
 		try {
 			migrated.wakeOn = normalizeWakeOn(task.wakeOn, hasShellPrompt);
 		} catch {
@@ -434,10 +565,6 @@ function normalizeTask(task, nowValue = new Date()) {
 	return migrated;
 }
 
-function isTaskShape(task) {
-	return normalizeTask(task) !== undefined;
-}
-
 function sanitizeTasks(value, nowValue = new Date()) {
 	if (!Array.isArray(value)) return [];
 	return value.map((task) => normalizeTask(task, nowValue)).filter(Boolean);
@@ -446,7 +573,10 @@ function sanitizeTasks(value, nowValue = new Date()) {
 function sortByNextRun(a, b) {
 	const aTime = Date.parse(a.nextRun ?? a.dueAt ?? "");
 	const bTime = Date.parse(b.nextRun ?? b.dueAt ?? "");
-	return (Number.isFinite(aTime) ? aTime : Number.POSITIVE_INFINITY) - (Number.isFinite(bTime) ? bTime : Number.POSITIVE_INFINITY);
+	return (
+		(Number.isFinite(aTime) ? aTime : Number.POSITIVE_INFINITY) -
+		(Number.isFinite(bTime) ? bTime : Number.POSITIVE_INFINITY)
+	);
 }
 
 function pendingTasks(tasks) {
@@ -458,7 +588,11 @@ function pendingTasks(tasks) {
 
 function dueTasks(tasks, nowValue = new Date()) {
 	const now = asDate(nowValue).getTime();
-	return pendingTasks(tasks).filter((task) => task.status === "pending" && Date.parse(task.nextRun ?? task.dueAt) <= now);
+	return pendingTasks(tasks).filter(
+		(task) =>
+			task.status === "pending" &&
+			Date.parse(task.nextRun ?? task.dueAt) <= now,
+	);
 }
 
 function findTask(tasks, idOrPrefix) {
@@ -470,7 +604,8 @@ function cancelScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
 	const now = asDate(nowValue);
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
-	if (task.status === "cancelled") throw new Error(`Scheduled task ${task.id} is already cancelled`);
+	if (task.status === "cancelled")
+		throw new Error(`Scheduled task ${task.id} is already cancelled`);
 	task.enabled = false;
 	task.status = "cancelled";
 	task.cancelledAt = now.toISOString();
@@ -492,12 +627,22 @@ function disableScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
 function enableScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
-	if (task.status === "cancelled" || task.status === "failed" || task.status === "fired") task.status = "pending";
+	if (
+		task.status === "cancelled" ||
+		task.status === "failed" ||
+		task.status === "fired"
+	)
+		task.status = "pending";
 	task.enabled = true;
-	const validated = validateTaskSchedule(task.type ?? "once", task.schedule ?? task.whenText ?? task.dueAt, nowValue);
+	const validated = validateTaskSchedule(
+		task.type ?? "once",
+		task.schedule ?? task.whenText ?? task.dueAt,
+		nowValue,
+	);
 	task.type = validated.type;
 	task.schedule = validated.schedule;
-	if (validated.intervalMs !== undefined) task.intervalMs = validated.intervalMs;
+	if (validated.intervalMs !== undefined)
+		task.intervalMs = validated.intervalMs;
 	task.nextRun = validated.nextRun;
 	task.dueAt = validated.dueAt;
 	return task;
@@ -511,44 +656,82 @@ function removeScheduledTask(tasks, idOrPrefix) {
 	return task;
 }
 
-function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Date()) {
+function updateScheduledTask(
+	tasks,
+	idOrPrefix,
+	updates = {},
+	nowValue = new Date(),
+) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 
-	if (updates.action !== undefined) task.action = normalizeAction(updates.action);
+	if (updates.action !== undefined)
+		task.action = normalizeAction(updates.action);
 	if (updates.type !== undefined) task.type = normalizeType(updates.type);
 	if (updates.scope !== undefined) task.scope = normalizeScope(updates.scope);
 	if (updates.enabled !== undefined) task.enabled = Boolean(updates.enabled);
 	if (updates.name !== undefined) task.name = compactSpaces(updates.name);
 	if (updates.title !== undefined) task.title = compactSpaces(updates.title);
-	if (updates.description !== undefined) task.description = compactSpaces(updates.description);
-	if (updates.maxRuns !== undefined) task.maxRuns = normalizeMaxRuns(updates.maxRuns);
+	if (updates.description !== undefined)
+		task.description = compactSpaces(updates.description);
+	if (updates.maxRuns !== undefined)
+		task.maxRuns = normalizeMaxRuns(updates.maxRuns);
 	if (updates.cwd !== undefined) task.cwd = String(updates.cwd);
-	if (updates.sessionFile !== undefined) task.sessionFile = String(updates.sessionFile);
-	if (updates.timeoutMs !== undefined) task.timeoutMs = validateTimeoutMs(updates.timeoutMs);
-	if (updates.followUpPrompt !== undefined) task.followUpPrompt = compactSpaces(updates.followUpPrompt) || undefined;
-	if (updates.successPrompt !== undefined) task.successPrompt = compactSpaces(updates.successPrompt) || undefined;
-	if (updates.failurePrompt !== undefined) task.failurePrompt = compactSpaces(updates.failurePrompt) || undefined;
-	if (updates.wakeOn !== undefined) task.wakeOn = normalizeWakeOn(updates.wakeOn, true);
+	if (updates.sessionFile !== undefined)
+		task.sessionFile = String(updates.sessionFile);
+	if (updates.timeoutMs !== undefined)
+		task.timeoutMs = validateTimeoutMs(updates.timeoutMs);
+	if (updates.followUpPrompt !== undefined)
+		task.followUpPrompt = compactSpaces(updates.followUpPrompt) || undefined;
+	if (updates.successPrompt !== undefined)
+		task.successPrompt = compactSpaces(updates.successPrompt) || undefined;
+	if (updates.failurePrompt !== undefined)
+		task.failurePrompt = compactSpaces(updates.failurePrompt) || undefined;
+	if (updates.wakeOn !== undefined)
+		task.wakeOn = normalizeWakeOn(updates.wakeOn, true);
 	if (updates.prompt !== undefined) task.prompt = compactSpaces(updates.prompt);
-	if (updates.message !== undefined) task.message = compactSpaces(updates.message);
-	if (updates.command !== undefined) task.command = compactSpaces(updates.command);
-	if (updates.triggerTurn !== undefined) task.triggerTurn = Boolean(updates.triggerTurn);
+	if (updates.message !== undefined)
+		task.message = compactSpaces(updates.message);
+	if (updates.command !== undefined)
+		task.command = coerceCommand(updates.command);
+	if (updates.triggerTurn !== undefined)
+		task.triggerTurn = Boolean(updates.triggerTurn);
 
-	if (updates.schedule !== undefined || updates.when !== undefined || updates.whenText !== undefined || updates.type !== undefined) {
-		const schedule = compactSpaces(updates.schedule ?? updates.whenText ?? updates.when ?? task.schedule ?? task.whenText ?? "");
-		const validated = validateTaskSchedule(task.type ?? "once", schedule, nowValue);
+	if (
+		updates.schedule !== undefined ||
+		updates.when !== undefined ||
+		updates.whenText !== undefined ||
+		updates.type !== undefined
+	) {
+		const schedule = compactSpaces(
+			updates.schedule ??
+				updates.whenText ??
+				updates.when ??
+				task.schedule ??
+				task.whenText ??
+				"",
+		);
+		const validated = validateTaskSchedule(
+			task.type ?? "once",
+			schedule,
+			nowValue,
+		);
 		task.type = validated.type;
 		task.schedule = validated.schedule;
 		task.whenText = schedule;
 		task.dueAt = validated.dueAt;
 		task.nextRun = task.enabled === false ? undefined : validated.nextRun;
-		if (validated.intervalMs !== undefined) task.intervalMs = validated.intervalMs;
+		if (validated.intervalMs !== undefined)
+			task.intervalMs = validated.intervalMs;
 		else delete task.intervalMs;
 	}
 
 	if (task.enabled !== false && !isTerminal(task) && !task.nextRun) {
-		const validated = validateTaskSchedule(task.type ?? "once", task.schedule ?? task.whenText, nowValue);
+		const validated = validateTaskSchedule(
+			task.type ?? "once",
+			task.schedule ?? task.whenText,
+			nowValue,
+		);
 		task.nextRun = validated.nextRun;
 		task.dueAt = validated.dueAt;
 	}
@@ -573,7 +756,8 @@ function finishTaskAfterRun(task, now, ok, result) {
 	if (ok) delete task.lastError;
 	if (result !== undefined) task.result = result;
 
-	const reachedMaxRuns = task.maxRuns !== undefined && task.runCount >= task.maxRuns;
+	const reachedMaxRuns =
+		task.maxRuns !== undefined && task.runCount >= task.maxRuns;
 	if (task.type === "once" || reachedMaxRuns) {
 		task.enabled = false;
 		task.status = ok ? "fired" : "failed";
@@ -589,7 +773,8 @@ function finishTaskAfterRun(task, now, ok, result) {
 		const validated = validateTaskSchedule(task.type, task.schedule, now);
 		task.nextRun = validated.nextRun;
 		task.dueAt = validated.dueAt;
-		if (validated.intervalMs !== undefined) task.intervalMs = validated.intervalMs;
+		if (validated.intervalMs !== undefined)
+			task.intervalMs = validated.intervalMs;
 	} catch {
 		task.enabled = false;
 		task.status = ok ? "fired" : "failed";
@@ -598,7 +783,13 @@ function finishTaskAfterRun(task, now, ok, result) {
 	return task;
 }
 
-function markScheduledTaskCompleted(tasks, idOrPrefix, nowValue = new Date(), result, options = {}) {
+function markScheduledTaskCompleted(
+	tasks,
+	idOrPrefix,
+	nowValue = new Date(),
+	result,
+	options = {},
+) {
 	const now = asDate(nowValue);
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
@@ -606,11 +797,23 @@ function markScheduledTaskCompleted(tasks, idOrPrefix, nowValue = new Date(), re
 	return finishTaskAfterRun(task, now, options.ok !== false, result);
 }
 
-function markScheduledTaskFired(tasks, idOrPrefix, nowValue = new Date(), result) {
-	return markScheduledTaskCompleted(tasks, idOrPrefix, nowValue, result, { ok: true });
+function markScheduledTaskFired(
+	tasks,
+	idOrPrefix,
+	nowValue = new Date(),
+	result,
+) {
+	return markScheduledTaskCompleted(tasks, idOrPrefix, nowValue, result, {
+		ok: true,
+	});
 }
 
-function markScheduledTaskFailed(tasks, idOrPrefix, nowValue = new Date(), error) {
+function markScheduledTaskFailed(
+	tasks,
+	idOrPrefix,
+	nowValue = new Date(),
+	error,
+) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 	task.lastError = error instanceof Error ? error.message : String(error);
@@ -619,12 +822,15 @@ function markScheduledTaskFailed(tasks, idOrPrefix, nowValue = new Date(), error
 
 function shellResultOk(result) {
 	if (typeof result?.ok === "boolean") return result.ok;
-	if (typeof result?.code === "number") return result.code === 0 && result.killed !== true;
+	if (typeof result?.code === "number")
+		return result.code === 0 && result.killed !== true;
 	return true;
 }
 
 function hasShellFollowUpPrompt(task) {
-	return Boolean(task.followUpPrompt || task.successPrompt || task.failurePrompt);
+	return Boolean(
+		task.followUpPrompt || task.successPrompt || task.failurePrompt,
+	);
 }
 
 function shouldWakeForShellResult(task, result) {
@@ -643,7 +849,8 @@ function selectShellFollowUpPrompt(task, result) {
 	if (ok && task.successPrompt) return task.successPrompt;
 	if (!ok && task.failurePrompt) return task.failurePrompt;
 	if (task.followUpPrompt) return task.followUpPrompt;
-	if (task.wakeOn && task.wakeOn !== "never") return "Review this scheduled shell command result and decide next steps.";
+	if (task.wakeOn && task.wakeOn !== "never")
+		return "Review this scheduled shell command result and decide next steps.";
 	return undefined;
 }
 
@@ -670,6 +877,25 @@ function formatRelativeTime(dueAt, nowValue = new Date()) {
 	return `in ${parts.join(" ") || "<1s"}`;
 }
 
+// Locale-independent month abbreviation table. Using a fixed table keeps the
+// "beyond tomorrow" date rendering deterministic across LANG/LC_TIME/LC_ALL,
+// while same-day ("at HH:MM") and tomorrow ("tomorrow at HH:MM") branches are
+// already locale-independent because they only render an HH:MM clock string.
+const MONTH_ABBR = [
+	"Jan",
+	"Feb",
+	"Mar",
+	"Apr",
+	"May",
+	"Jun",
+	"Jul",
+	"Aug",
+	"Sep",
+	"Oct",
+	"Nov",
+	"Dec",
+];
+
 function formatAbsoluteTime(nextRun, nowValue = new Date()) {
 	const date = new Date(nextRun);
 	if (!Number.isFinite(date.getTime())) return "unknown";
@@ -677,7 +903,12 @@ function formatAbsoluteTime(nextRun, nowValue = new Date()) {
 	const tomorrow = new Date(now);
 	tomorrow.setDate(tomorrow.getDate() + 1);
 
-	const timeStr = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+	// Build the time string directly from the date parts so it never depends on
+	// the host locale. Always 24-hour, zero-padded HH:MM in the date's own
+	// local time (matches the prior same-day/tomorrow behavior).
+	const hours = String(date.getHours()).padStart(2, "0");
+	const minutes = String(date.getMinutes()).padStart(2, "0");
+	const timeStr = `${hours}:${minutes}`;
 
 	if (date.toDateString() === now.toDateString()) {
 		return `at ${timeStr}`;
@@ -685,7 +916,9 @@ function formatAbsoluteTime(nextRun, nowValue = new Date()) {
 	if (date.toDateString() === tomorrow.toDateString()) {
 		return `tomorrow at ${timeStr}`;
 	}
-	return `on ${date.toLocaleDateString([], { month: "short", day: "numeric" })} at ${timeStr}`;
+	// Beyond tomorrow: render a stable month-then-day form regardless of locale.
+	const month = MONTH_ABBR[date.getMonth()] ?? String(date.getMonth() + 1);
+	return `on ${month} ${date.getDate()} at ${timeStr}`;
 }
 
 function formatSchedule(task) {
@@ -696,17 +929,28 @@ function formatSchedule(task) {
 
 function formatTaskLine(task, nowValue = new Date()) {
 	const label = task.name || task.title || task.id;
-	const next = task.nextRun ? `${formatRelativeTime(task.nextRun, nowValue)} (${new Date(task.nextRun).toLocaleString()})` : "no next run";
+	const next = task.nextRun
+		? `${formatRelativeTime(task.nextRun, nowValue)} (${new Date(task.nextRun).toLocaleString()})`
+		: "no next run";
 	const enabled = task.enabled === false ? "disabled" : "enabled";
 	const last = task.lastStatus ? ` last=${task.lastStatus}` : "";
 	return `- ${task.id} ${label} next=${next} [${task.action}/${task.type}] ${enabled} status=${task.status} runs=${task.runCount ?? 0}${last} schedule=${formatSchedule(task)} :: ${taskSummary(task)}`;
 }
 
 function formatTaskList(tasks, nowValue = new Date(), options = {}) {
-	const list = options.includeAll ? tasks.slice().sort(sortByNextRun) : pendingTasks(tasks);
-	if (list.length === 0) return options.includeAll ? "No scheduled tasks." : "No active scheduled tasks.";
-	const title = options.includeAll ? "Scheduled tasks:" : "Active scheduled tasks:";
-	return [title, ...list.map((task) => formatTaskLine(task, nowValue))].join("\n");
+	const list = options.includeAll
+		? tasks.slice().sort(sortByNextRun)
+		: pendingTasks(tasks);
+	if (list.length === 0)
+		return options.includeAll
+			? "No scheduled tasks."
+			: "No active scheduled tasks.";
+	const title = options.includeAll
+		? "Scheduled tasks:"
+		: "Active scheduled tasks:";
+	return [title, ...list.map((task) => formatTaskLine(task, nowValue))].join(
+		"\n",
+	);
 }
 
 module.exports = {
@@ -723,6 +967,7 @@ module.exports = {
 	parseWhen,
 	validateTaskSchedule,
 	splitScheduleCommand,
+	coerceCommand,
 	normalizeAction,
 	normalizeType,
 	normalizeScope,

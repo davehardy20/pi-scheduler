@@ -1,8 +1,8 @@
 # Pi Scheduler
 
-**Scheduled actions for Pi agents: reminders, self-waking prompts, recurring shell commands, and command-output follow-ups.**
+**Scheduled actions for Pi agents: reminders, self-waking prompts, allowlisted structured shell commands, and command-output follow-ups.**
 
-Pi Scheduler is a [Pi](https://github.com/earendil-works/pi) extension that lets an agent schedule future work from inside the conversation. It focuses on **scheduled actions**, not just prompts: the agent can wake itself later, run shell commands directly, capture stdout/stderr, and decide what to do next.
+Pi Scheduler is a [Pi](https://github.com/earendil-works/pi) extension that lets an agent schedule future work from inside the conversation. It focuses on **scheduled actions**, not just prompts: the agent can wake itself later, run allowlisted structured commands directly (no shell), pass stdout/stderr to the in-memory follow-up prompt, and decide what to do next.
 
 ## Why?
 
@@ -20,11 +20,12 @@ Without scheduling, the agent has to stop and hope you come back. With Pi Schedu
 ## Features
 
 - **Self-waking prompts** — schedule a future prompt that wakes the agent in the current Pi session.
-- **Direct shell scheduling** — run commands later or repeatedly without first asking the model to call `bash`.
+- **Direct, deny-by-default shell scheduling** — run allowlisted structured commands later or repeatedly, validated at scheduling and firing time, never through a shell.
 - **Command-output follow-ups** — feed stdout/stderr back to the agent with success/failure-specific instructions.
 - **Recurring schedules** — `once`, `interval`, and `cron` schedules for all action types.
 - **Bounded polling** — `maxRuns` disables recurring tasks after a fixed number of executions.
 - **Task lifecycle management** — enable, disable, update, remove, cleanup, list.
+- **Cross-process safe persistence** — locked transactions, atomic claims with leases, and automatic crash recovery.
 - **Scopes** — bind tasks to a session, cwd/project, or all sessions.
 - **Compact widget** — shows the next few scheduled actions below the editor.
 - **Persistent state** — scheduled tasks are stored in `~/.pi/agent/state/scheduler/tasks.json`.
@@ -62,10 +63,38 @@ Pi Scheduler registers these tools for the agent:
 
 | Action | What it does | Best for |
 | --- | --- | --- |
-| `shell` | Runs a shell command and stores stdout/stderr | CI polling, tests, status commands |
+| `shell` | Runs an allowlisted structured command directly (no shell); exit metadata is persisted, stdout/stderr are passed to the in-memory follow-up prompt only and are NOT persisted | CI polling, tests, status commands |
 | `prompt` | Injects a user prompt and wakes the agent | Agentic follow-ups |
 | `notify` | Shows a reminder/notification | Human reminders |
 | `message` | Injects a scheduled custom message | Lightweight status/context messages |
+
+### Scheduling shell tasks
+
+Shell tasks are **structured**: the agent provides a command object
+`{ executable, argv }`, never a command string. The `/schedule` slash command
+and `/remind` are for `notify`, `prompt`, and `message` actions only. **The
+`/schedule shell <when> :: <command-string>` slash syntax is rejected** — a
+legacy command string is never interpreted through a shell, so it always fails
+closed.
+
+To schedule a shell task, use the **`schedule_task`** tool with a structured
+command:
+
+```json
+{
+  "action": "shell",
+  "type": "once",
+  "schedule": "2m",
+  "command": { "executable": "npm", "argv": ["test"] },
+  "cwd": "/repo",
+  "wakeOn": "always",
+  "followUpPrompt": "Review this test output."
+}
+```
+
+A `schedule_task` shell task is validated against the user-owned execution
+policy at scheduling time and revalidated immediately before firing; only
+structured commands matching the policy allowlist run, directly (no shell).
 
 ### Schedule types
 
@@ -85,7 +114,9 @@ Cron expressions use `croner`; 6-field expressions with seconds are recommended:
 
 ## Example: bounded GitLab pipeline polling
 
-Schedule a direct command every 5 minutes, wake the agent only if it fails, and stop after 10 checks:
+Schedule a direct, allowlisted command every 5 minutes, wake the agent only if
+it fails, and stop after 10 checks. Requires a matching entry in
+`scheduler-policy.json` (see [Scheduled shell execution is deny-by-default](#scheduled-shell-execution-is-deny-by-default)):
 
 ```json
 {
@@ -93,7 +124,8 @@ Schedule a direct command every 5 minutes, wake the agent only if it fails, and 
   "type": "interval",
   "schedule": "5m",
   "name": "pipeline-123",
-  "command": "glab pipeline view 123 --repo jl1990/example",
+  "command": { "executable": "glab", "argv": ["pipeline", "view", "123", "--repo", "jl1990/example"] },
+  "cwd": "/repo",
   "wakeOn": "failure",
   "failurePrompt": "The scheduled pipeline check failed or returned a non-zero status. Inspect the pipeline/jobs/logs and propose or apply fixes.",
   "maxRuns": 10,
@@ -120,7 +152,8 @@ Schedule a direct command every 5 minutes, wake the agent only if it fails, and 
   "action": "shell",
   "type": "once",
   "schedule": "2m",
-  "command": "npm test",
+  "command": { "executable": "npm", "argv": ["test"] },
+  "cwd": "/repo",
   "wakeOn": "always",
   "followUpPrompt": "Review this test output. If tests failed, fix the issue. If they passed, summarize the result."
 }
@@ -146,13 +179,17 @@ Examples:
 ```text
 /remind 5m stretch
 /schedule prompt 3m :: Check the GitLab pipeline and schedule another check if still running.
-/schedule shell every 5m :: glab pipeline view 123 --repo jl1990/example
-/schedule shell cron 0 */5 * * * * :: date
+/schedule message 5m :: build started
 /schedules
 /schedules all
 /schedule-disable task_abc123
 /schedule-cleanup
 ```
+
+> Shell tasks are structured and use the `schedule_task` tool, not `/schedule shell`.
+> See [Scheduling shell tasks](#scheduling-shell-tasks) above. The
+> `/schedule shell <when> :: <command-string>` syntax is rejected (legacy
+> command strings are never interpreted through a shell).
 
 ## Time formats
 
@@ -209,13 +246,13 @@ Prompt priority:
 
 Pi Scheduler focuses on **scheduled actions**:
 
-- direct scheduled shell commands
-- deterministic stdout/stderr capture
+- direct scheduled structured shell commands (no shell, allowlisted)
+- stdout/stderr passed to the in-memory follow-up prompt only (not persisted)
 - success/failure-specific agent wakeups
 - bounded command polling with `maxRuns`
 - prompt/notify/message actions as lightweight companions
 
-The goal is to make command-driven automation simple: schedule the check, capture the result, and wake the agent only when useful.
+The goal is to make command-driven automation simple: schedule the check, pass the result to the agent, and wake the agent only when useful.
 
 ## Important limitations
 
@@ -253,6 +290,133 @@ Try a command without starting a model turn:
 PI_OFFLINE=1 pi --no-extensions -e ./extensions/scheduler/index.ts --no-session --mode json -p "/schedules"
 ```
 
+## Scheduled shell execution is deny-by-default
+
+Direct process execution is **disabled by default**. The agent can always
+schedule safe actions (`prompt`, `notify`, `message`) without any extra
+configuration, but `shell` tasks only run when a user-owned execution policy
+explicitly opts in.
+
+The policy lives at:
+
+```text
+~/.pi/agent/state/scheduler/scheduler-policy.json
+```
+
+If the file is missing or malformed, every `shell` task fails closed. A
+legacy command **string** is never interpreted through a shell: it is rejected
+and the user must re-create it as a structured command. Only structured
+`{ executable, argv }` commands that match an `allow` entry are run, and they
+are invoked **directly (no shell)** — `bash -lc ...` is never used.
+
+The policy is loaded **fresh for every scheduling and firing decision** — it is
+not cached for the session. So editing, `chmod`/`chown`-ing, or removing the
+file takes effect at the next decision without restarting Pi. The file must be
+a **regular file owned by the current user**, and on POSIX it must **not be
+group- or world-writable** (a writable policy file is rejected and fails
+closed). Set restrictive permissions with:
+
+```bash
+chmod 600 ~/.pi/agent/state/scheduler/scheduler-policy.json
+```
+
+An entry authorizes a command only when the executable matches exactly, the
+argv starts with the entry's `argvPrefix`, and the firing `cwd` is contained
+beneath the entry's `cwdRoot`. Commands are validated **at scheduling time**
+and **revalidated immediately before firing**.
+
+Example policy (allow `npm test` and `npm run` beneath `/path/to/your/project`):
+
+```json
+{
+  "execution": {
+    "enabled": true,
+    "allow": [
+      { "executable": "npm", "argvPrefix": ["test"], "cwdRoot": "/path/to/your/project" },
+      { "executable": "npm", "argvPrefix": ["run"], "cwdRoot": "/path/to/your/project" }
+    ]
+  }
+}
+```
+
+Structured shell task example:
+
+```json
+{
+  "action": "shell",
+  "type": "interval",
+  "schedule": "5m",
+  "name": "repo-tests",
+  "command": { "executable": "npm", "argv": ["test"] },
+  "cwd": "/repo",
+  "wakeOn": "failure",
+  "failurePrompt": "Tests failed. Inspect the output and propose a fix.",
+  "maxRuns": 10
+}
+```
+
+For security, scheduled run results do not persist raw `stdout`/`stderr` or
+the full command text to the state file — only exit metadata (code, killed,
+executable, cwd). Captured output is passed to the in-memory follow-up prompt
+only.
+
+## Persistence, claims, and crash recovery
+
+Scheduled tasks are stored in a locked, cross-process task store at
+`~/.pi/agent/state/scheduler/tasks.json`. Every load/mutate/save runs inside a
+store transaction that serializes read-modify-write and reloads state while the
+lock is held, so concurrent Pi sessions cannot lose updates.
+
+When a task is due, the runner that owns this Pi process atomically **claims**
+it with a stable, unique runner identity and a lease that covers the execution
+timeout with margin. **Only the claim owner executes and completes the task.**
+If the owning process crashes mid-run, the lease expires and a later runner
+recovers the claim automatically. A task claimed by a runner that should not
+execute it (for example, an out-of-scope task claimed by the wrong session) is
+**abandoned**, not marked fired: its claim metadata is cleared and it is
+restored to pending without incrementing its run count, so a future eligible
+run can pick it up. If a one-shot timer fires but the store claim fails under
+contention, the scheduler retries the claim a bounded number of times and then
+re-arms the task so it is not stranded. Safe actions (`prompt`, `notify`,
+`message`) are unaffected and remain safe to schedule without any policy.
+
+## Bounded GitHub PR CI / Codex monitoring (prompt-based)
+
+The recommended way to monitor a pull request is **not** to run `gh`/`git` as a
+scheduled shell task. Instead schedule a `prompt` action that asks the agent to
+check status using the safe wrappers, and bound how many autonomous fix rounds
+are attempted. This keeps all GitHub/Git access through `gh_safe` / `git_safe`
+and the Codex PR-comment skill.
+
+Recommended workflow:
+
+1. Schedule a recurring `prompt` with `maxRuns` so it stops on its own:
+
+   ```json
+   {
+     "action": "prompt",
+     "type": "interval",
+     "schedule": "5m",
+     "name": "pr-123-ci",
+     "maxRuns": 12,
+     "prompt": "Check PR #123 CI status. Use gh_safe pr_view (or gh pr view) with statusCheckRollup. If checks are still pending, do nothing and wait for the next scheduled check. If a check failed, inspect logs with gh_safe and apply a minimal fix; bound yourself to at most 3 autonomous fix attempts before stopping and reporting. If checks pass and review is clean, summarize and let the schedule expire."
+   }
+   ```
+
+2. Treat `gh` exit code **8** ("pending") as **pending**, not failure. The
+   agent should not interpret a pending check as a failed check.
+
+3. Use the **Codex PR-comment skill** (`/skill:codex-pr-comment`) to read and
+   action required automated review comments, not a scheduled shell task.
+
+4. Bound autonomous fix rounds explicitly in the prompt (e.g. "at most 3
+   attempts") so the agent does not loop indefinitely on a failing check.
+
+This package does **not** invoke the retired `pi-khronos`; all scheduling is
+handled by this extension's in-process timers. While a Pi session is open, due
+tasks fire at the scheduled time; missed/due tasks fire again when the relevant
+session starts.
+
 ## Publishing
 
 This package is published as:
@@ -274,4 +438,9 @@ Then create/publish a GitHub Release for the new tag. The workflow will run test
 
 ## Security notes
 
-This extension can run scheduled shell commands with your local user permissions. Only install Pi packages from sources you trust, and review scheduled shell tasks before using them in sensitive environments.
+Scheduled `shell` execution is **deny-by-default** and only runs allowlisted
+structured commands directly (no shell). Legacy command strings and any command
+not matching the user-owned `scheduler-policy.json` fail closed. Safe actions
+(`prompt`, `notify`, `message`) require no policy. Even when allowed, scheduled
+run results do not persist raw output or full command text. Only install Pi
+packages from sources you trust.
