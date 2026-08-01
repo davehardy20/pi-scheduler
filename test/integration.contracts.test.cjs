@@ -700,11 +700,31 @@ test("all lease recovery paths re-check liveness after async reloads", () => {
 	);
 	assert.match(
 		recovery,
-		/for \(const task of expired\)[\s\S]*?await reloadTasks\(\);[\s\S]*?if \(generation === sessionGeneration && !isShutdown\)[\s\S]*?rescheduleAll\(ctx\)/,
+		/for \(const task of expired\)[\s\S]*?refreshActiveSessionAfterMutation\(generation, ctx\)/,
 	);
 	assert.match(
 		recovery,
 		/catch \{[\s\S]*?await reloadTasks\(\);[\s\S]*?if \(generation === sessionGeneration && !isShutdown\)[\s\S]*?armLeaseRecovery\(ctx\)/,
+	);
+});
+
+test("stale claim abandonment refreshes the active successor session", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const recovery = source.slice(
+		source.indexOf("async function recoverExpiredLeases"),
+		source.indexOf("function recordMessage"),
+	);
+	assert.match(
+		recovery,
+		/safeReleaseClaim\([\s\S]*?refreshActiveSessionAfterMutation\(generation, ctx\)/,
+	);
+	const fireTask = source.slice(
+		source.indexOf("async function fireTask"),
+		source.indexOf("const task = claimed.task"),
+	);
+	assert.match(
+		fireTask,
+		/safeReleaseClaim\([\s\S]*?refreshActiveSessionAfterMutation\(generation, ctx\)/,
 	);
 });
 
@@ -724,5 +744,21 @@ test("fireTask re-checks liveness after claim reloads", () => {
 			/await reloadTasks\(\);[\s\S]*?catch \{[\s\S]*?\}[\s\S]*?if \(generation !== sessionGeneration \|\| isShutdown\) return;[\s\S]*?rescheduleAll\(ctx\)/g,
 		)?.length,
 		2,
+	);
+});
+
+test("claim reload failures use bounded delayed retries", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	assert.match(
+		source,
+		/function scheduleClaimRetry[\s\S]*?runtime\.claimFalseRearmDelay\(attempt\)/,
+	);
+	const claimFalse = source.slice(
+		source.indexOf("if (!claimed?.claimed)"),
+		source.indexOf("const task = claimed.task"),
+	);
+	assert.match(
+		claimFalse,
+		/catch[\s\S]*?scheduleClaimRetry\(taskId, ctx, generation, rearmAttempt\)/,
 	);
 });

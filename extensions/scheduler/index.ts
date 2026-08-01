@@ -386,6 +386,23 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		}, delay);
 	}
 
+	async function refreshActiveSessionAfterMutation(
+		originGeneration: number,
+		originCtx: ExtensionContext,
+	): Promise<void> {
+		if (isShutdown) return;
+		try {
+			await reloadTasks();
+		} catch {
+			// A later active-session operation will retry the persisted reload.
+			return;
+		}
+		if (isShutdown) return;
+		rescheduleAll(
+			originGeneration === sessionGeneration ? originCtx : activeCtx,
+		);
+	}
+
 	/**
 	 * Reload state, find persisted RUNNING tasks with expired leases, and
 	 * reclaim them through the store so a crashed owner does not strand a task.
@@ -431,10 +448,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 					);
 				}
 			}
-			if (generation === sessionGeneration && !isShutdown) {
-				await reloadTasks();
-				if (generation === sessionGeneration && !isShutdown) rescheduleAll(ctx);
-			}
+			await refreshActiveSessionAfterMutation(generation, ctx);
 		} catch {
 			// A transient store/claim failure must not strand an expired lease.
 			// Reload when possible, then re-arm from the current in-memory snapshot;
@@ -602,9 +616,27 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 
+	function scheduleClaimRetry(
+		taskId: string,
+		ctx: ExtensionContext,
+		generation: number,
+		attempt: number,
+	): void {
+		if (generation !== sessionGeneration || isShutdown) return;
+		clearHandle(taskId);
+		const delay = runtime.claimFalseRearmDelay(attempt);
+		const timer = setTimeout(() => {
+			handles.delete(taskId);
+			if (generation !== sessionGeneration || isShutdown) return;
+			void fireTask(taskId, ctx, attempt + 1);
+		}, delay);
+		handles.set(taskId, { kind: "timeout", handle: timer });
+	}
+
 	async function fireTask(
 		taskId: string,
 		ctx: ExtensionContext,
+		rearmAttempt = 0,
 	): Promise<void> {
 		// Claim the due task atomically through the store. Only the claim owner
 		// (matching runnerId + claimToken) is allowed to execute and complete.
@@ -660,11 +692,13 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		// execute after the generation changes. If this runner acquired the claim
 		// during that window, release it without completing or rescheduling it.
 		if (generation !== sessionGeneration || isShutdown) {
-			if (claimed?.claimed)
+			if (claimed?.claimed) {
 				await safeReleaseClaim(
 					claimed.task as ScheduledTask,
 					claimed.claimToken,
 				);
+				await refreshActiveSessionAfterMutation(generation, ctx);
+			}
 			return;
 		}
 
@@ -675,13 +709,16 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			// retry the claim. Guarded by the generation so a shutdown during the
 			// claim retry does not re-arm after shutdown.
 			if (generation !== sessionGeneration || isShutdown) return;
+			let reloaded = false;
 			try {
 				await reloadTasks();
+				reloaded = true;
 			} catch {
-				// reload is best-effort; rescheduleAll uses the in-memory mirror.
+				// Retry with bounded backoff instead of immediately reusing stale state.
 			}
 			if (generation !== sessionGeneration || isShutdown) return;
-			rescheduleAll(ctx);
+			if (reloaded) rescheduleAll(ctx);
+			else scheduleClaimRetry(taskId, ctx, generation, rearmAttempt);
 			return;
 		}
 		if (!claimed?.claimed) {
@@ -690,13 +727,16 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			// lease expires (high fix 2). Use a bounded, NON-ZERO rearm so this
 			// does NOT spin in a zero-delay infinite loop (claim-error retry fix).
 			if (generation !== sessionGeneration || isShutdown) return;
+			let reloaded = false;
 			try {
 				await reloadTasks();
+				reloaded = true;
 			} catch {
-				// reload is best-effort.
+				// Retry with bounded backoff instead of immediately reusing stale state.
 			}
 			if (generation !== sessionGeneration || isShutdown) return;
-			rescheduleAll(ctx);
+			if (reloaded) rescheduleAll(ctx);
+			else scheduleClaimRetry(taskId, ctx, generation, rearmAttempt);
 			return;
 		}
 
@@ -707,6 +747,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		// for a future eligible run — do NOT mark it fired.
 		if (!taskBelongsToSession(task, ctx)) {
 			await safeReleaseClaim(task, claimed.claimToken);
+			await refreshActiveSessionAfterMutation(generation, ctx);
 			return;
 		}
 
