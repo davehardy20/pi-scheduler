@@ -651,6 +651,31 @@ test("index.ts wires fireTask execution settle through runClaimedExecution", () 
 	);
 });
 
+test("index.ts refreshes the active successor after an older execution settles", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	assert.match(source, /shouldReload: \(\) => !isShutdown/);
+	assert.match(
+		source,
+		/await reloadTasks\(\);[\s\S]*?generation !== sessionGeneration && !isShutdown[\s\S]*?rescheduleAll\(\)/,
+	);
+});
+
+test("shell completion avoids stale-session messages after async execution", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const executeTask = source.slice(
+		source.indexOf("async function executeTask"),
+		source.indexOf("function sleep"),
+	);
+	assert.match(
+		executeTask,
+		/const result = await pi\.exec[\s\S]*?if \(isLive\(\)\) \{[\s\S]*?recordMessage\([\s\S]*?sendAgentPrompt\(/,
+	);
+	assert.match(
+		source,
+		/executeTask\([\s\S]*?\(\) => generation === sessionGeneration && !isShutdown/,
+	);
+});
+
 test("lease recovery refreshes persisted state before rearming an empty sweep", () => {
 	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
 	const emptyBranch = source.match(
@@ -689,9 +714,13 @@ test("fireTask re-checks liveness after claim reloads", () => {
 		source.indexOf("async function fireTask"),
 		source.indexOf("async function safeReleaseClaim"),
 	);
-	assert.equal(fireTask.match(/await reloadTasks\(\)/g)?.length, 2);
+	const claimPreparation = fireTask.slice(
+		0,
+		fireTask.indexOf("const task = claimed.task"),
+	);
+	assert.equal(claimPreparation.match(/await reloadTasks\(\)/g)?.length, 2);
 	assert.equal(
-		fireTask.match(
+		claimPreparation.match(
 			/await reloadTasks\(\);[\s\S]*?catch \{[\s\S]*?\}[\s\S]*?if \(generation !== sessionGeneration \|\| isShutdown\) return;[\s\S]*?rescheduleAll\(ctx\)/g,
 		)?.length,
 		2,

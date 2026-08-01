@@ -471,6 +471,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	async function executeTask(
 		task: ScheduledTask,
 		ctx: ExtensionContext,
+		isLive = () => true,
 	): Promise<Record<string, any>> {
 		if (task.action === "notify") {
 			const message = task.message ?? "Scheduled reminder";
@@ -545,30 +546,40 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				killed: result.killed,
 			};
 
-			recordMessage(
-				runtime.shellCompletionMessage(task, shellResult),
-				{
-					task: runtime.redactTaskForMessage(task),
-					result: runtime.redactResultForMessage(shellResult),
-				},
-				false,
-			);
+			// The command result must still be returned for durable claim completion,
+			// but a stopped/replaced session must not receive stale messages/prompts.
+			if (isLive()) {
+				recordMessage(
+					runtime.shellCompletionMessage(task, shellResult),
+					{
+						task: runtime.redactTaskForMessage(task),
+						result: runtime.redactResultForMessage(shellResult),
+					},
+					false,
+				);
 
-			if (core.shouldWakeForShellResult(task, shellResult)) {
-				// stdout/stderr are passed to the in-memory follow-up prompt only,
-				// never written to the persisted store.
-				const transient = {
-					...shellResult,
-					stdout: truncateMiddle(result.stdout ?? "", MAX_PROMPT_OUTPUT_CHARS),
-					stderr: truncateMiddle(result.stderr ?? "", MAX_PROMPT_OUTPUT_CHARS),
-				};
-				const instruction = core.selectShellFollowUpPrompt(task, shellResult);
-				if (instruction)
-					sendAgentPrompt(
-						pi,
-						ctx,
-						shellResultPrompt(task, transient, instruction),
-					);
+				if (core.shouldWakeForShellResult(task, shellResult)) {
+					// stdout/stderr are passed to the in-memory follow-up prompt only,
+					// never written to the persisted store.
+					const transient = {
+						...shellResult,
+						stdout: truncateMiddle(
+							result.stdout ?? "",
+							MAX_PROMPT_OUTPUT_CHARS,
+						),
+						stderr: truncateMiddle(
+							result.stderr ?? "",
+							MAX_PROMPT_OUTPUT_CHARS,
+						),
+					};
+					const instruction = core.selectShellFollowUpPrompt(task, shellResult);
+					if (instruction)
+						sendAgentPrompt(
+							pi,
+							ctx,
+							shellResultPrompt(task, transient, instruction),
+						);
+				}
 			}
 
 			return shellResult;
@@ -715,7 +726,12 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				task,
 				{ taskId: task.id, runnerId, claimToken, claimGeneration },
 				{
-					execute: (t: ScheduledTask) => executeTask(t, ctx),
+					execute: (t: ScheduledTask) =>
+						executeTask(
+							t,
+							ctx,
+							() => generation === sessionGeneration && !isShutdown,
+						),
 					complete: async ({ result, ok }) => {
 						// Persist the outcome even if shutdown occurred while the
 						// action was running: the action may already have produced
@@ -731,8 +747,15 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 							ok,
 						});
 					},
-					reload: () => reloadTasks(),
+					reload: async () => {
+						await reloadTasks();
+						// If this execution belongs to an older generation, refresh
+						// and re-arm the currently active successor session.
+						if (generation !== sessionGeneration && !isShutdown)
+							rescheduleAll();
+					},
 					isLive: () => generation === sessionGeneration && !isShutdown,
+					shouldReload: () => !isShutdown,
 					reportTaskFailure: (error: any) => {
 						const message = `Scheduled task ${task.id} failed: ${error?.message ?? String(error)}`;
 						if (ctx.hasUI) ctx.ui.notify(message, "error");

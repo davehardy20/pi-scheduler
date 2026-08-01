@@ -185,6 +185,30 @@ test("Windows rename permission codes are treated as potential lock contention",
 	assert.equal(isPotentialLockContentionError("ENOTEMPTY", "win32"), true);
 });
 
+test("Windows tombstone permission errors are contention only when the destination exists", async () => {
+	await withTempDir(async (dir) => {
+		const destination = join(dir, "existing-tombstone");
+		mkdirSync(destination);
+		const { isExistingDestinationContention } = loadStore();
+		assert.equal(
+			await isExistingDestinationContention("EPERM", destination, "win32"),
+			true,
+		);
+		assert.equal(
+			await isExistingDestinationContention(
+				"EACCES",
+				join(dir, "missing-tombstone"),
+				"win32",
+			),
+			false,
+		);
+		assert.equal(
+			await isExistingDestinationContention("EPERM", destination, "linux"),
+			false,
+		);
+	});
+});
+
 test("transaction serializes read-modify-write without lost updates across processes", async () => {
 	// Contract: two REAL concurrent child processes each increment a per-task
 	// counter by performing a full read-modify-write inside a store transaction.

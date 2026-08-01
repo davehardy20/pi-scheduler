@@ -391,6 +391,7 @@ function fakesWithDeps(extra = {}) {
 			if (extra.reloadThrows) throw new Error("reload store read failed");
 		},
 		isLive: extra.isLive ?? (() => true),
+		...(extra.shouldReload ? { shouldReload: extra.shouldReload } : {}),
 		reportTaskFailure: (error, task) =>
 			recordCall(f.calls.reportTaskFailure, {
 				error: error?.message ?? String(error),
@@ -428,6 +429,36 @@ test("runClaimedExecution: success persists result and performs no live side eff
 	});
 	// Not live: no reload, no failure/persistence reports.
 	assert.equal(f.calls.reload, 0, "reload must be skipped when not live");
+	assert.equal(f.calls.reportTaskFailure.length, 0);
+	assert.equal(f.calls.reportPersistenceFailure.length, 0);
+});
+
+test("runClaimedExecution: successor session reloads an older generation's durable completion", async () => {
+	const { f, deps } = fakesWithDeps({
+		isLive: () => false,
+		shouldReload: () => true,
+		execute: fakeExecute({ ok: true, delivered: "notify" }),
+	});
+	await runClaimedExecution(TASK, CLAIM, deps);
+	assert.equal(f.calls.complete.length, 1);
+	assert.equal(
+		f.calls.reload,
+		1,
+		"the active successor must refresh persisted state",
+	);
+	assert.equal(f.calls.reportTaskFailure.length, 0);
+	assert.equal(f.calls.reportPersistenceFailure.length, 0);
+});
+
+test("runClaimedExecution: successor reloads an older generation's durable failure", async () => {
+	const { f, deps } = fakesWithDeps({
+		isLive: () => false,
+		shouldReload: () => true,
+		execute: async () => rejectedExecute("policy refused"),
+	});
+	await runClaimedExecution(TASK, CLAIM, deps);
+	assert.deepEqual(f.calls.complete, [{ result: undefined, ok: false }]);
+	assert.equal(f.calls.reload, 1);
 	assert.equal(f.calls.reportTaskFailure.length, 0);
 	assert.equal(f.calls.reportPersistenceFailure.length, 0);
 });

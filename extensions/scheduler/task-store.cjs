@@ -11,6 +11,21 @@ function isPotentialLockContentionError(code, platform = process.platform) {
 	return platform === "win32" && (code === "EPERM" || code === "EACCES");
 }
 
+async function isExistingDestinationContention(
+	code,
+	destination,
+	platform = process.platform,
+) {
+	if (!isPotentialLockContentionError(code, platform)) return false;
+	try {
+		await fs.lstat(destination);
+		return true;
+	} catch (error) {
+		if (error.code === "ENOENT") return false;
+		throw error;
+	}
+}
+
 // Warn callback default: surfaced warnings are opt-in so a plain store does
 // not write to stderr. Callers (the runtime) pass onWarning to surface
 // malformed-state recovery to the user.
@@ -393,11 +408,17 @@ function createTaskStore(options = {}) {
 				// do; the lock is free for acquisition.
 				return { reaped: false, gone: true };
 			}
-			if (error.code === "ENOTEMPTY" || error.code === "EEXIST") {
+			if (
+				["EEXIST", "ENOTEMPTY"].includes(error.code) ||
+				(await isExistingDestinationContention(
+					error.code,
+					tombstone,
+					process.platform,
+				))
+			) {
 				// The deterministic tombstone for THIS observed owner already
-				// exists and is non-empty: another reclaimer already reaped this
-				// owner. Back off. We deliberately do NOT delete or overwrite the
-				// tombstone (that would reopen the delayed-reclaimer race).
+				// exists: another reclaimer won. Windows may report EPERM/EACCES
+				// for the occupied destination instead of EEXIST/ENOTEMPTY.
 				return { reaped: false, tombstone: true };
 			}
 			throw error;
@@ -924,4 +945,8 @@ function createTaskStore(options = {}) {
 	};
 }
 
-module.exports = { createTaskStore, isPotentialLockContentionError };
+module.exports = {
+	createTaskStore,
+	isPotentialLockContentionError,
+	isExistingDestinationContention,
+};

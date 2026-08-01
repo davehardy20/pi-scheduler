@@ -223,7 +223,9 @@ function renderCommand(command) {
  *   * A success/result COMPLETION error is NEVER downgraded to `{ok:false}`.
  *     If live, it reports a PERSISTENCE failure; if not live, it is silent.
  *     Either way no `{ok:false}` is written and no task-failed is reported.
- *   * `reload()` and the failure/persistence reports are gated on `isLive()`.
+ *   * `reload()` is gated on `shouldReload()` (defaulting to `isLive()`) so a
+ *     successor session can refresh an older generation's durable completion.
+ *   * Failure/persistence reports remain gated on the originating `isLive()`.
  *   * A `reload()` error after durable success never reports task-failed
  *     (reload is best-effort) and never downgrades to `{ok:false}`.
  *
@@ -235,8 +237,9 @@ function renderCommand(command) {
  * @param {object} deps injected behavior
  * @param {() => Promise<any>} deps.execute runs the task action; rejection => ok:false
  * @param {(payload: {result?: any, ok: boolean}) => Promise<void>} deps.complete persists the outcome
- * @param {() => Promise<void>} [deps.reload] best-effort in-memory mirror refresh (live only)
- * @param {() => boolean} deps.isLive true while the session is still live
+ * @param {() => Promise<void>} [deps.reload] best-effort in-memory mirror refresh
+ * @param {() => boolean} deps.isLive true while the originating session is live
+ * @param {() => boolean} [deps.shouldReload] true when any active session needs the durable update
  * @param {(error: any, task: object) => void} [deps.reportTaskFailure] live failure surface (UI/message)
  * @param {(error: any, task: object, result: any) => void} [deps.reportPersistenceFailure] live persistence-failure surface
  * @returns {Promise<void>}
@@ -247,6 +250,7 @@ async function runClaimedExecution(task, _claim, deps) {
 		complete,
 		reload,
 		isLive,
+		shouldReload = isLive,
 		reportTaskFailure,
 		reportPersistenceFailure,
 	} = deps;
@@ -272,17 +276,16 @@ async function runClaimedExecution(task, _claim, deps) {
 		} catch (error) {
 			completionError = error;
 		}
+		if (!completionError && shouldReload() && reload) {
+			try {
+				await reload();
+			} catch {
+				// reload is best-effort after durable failed completion.
+			}
+		}
 		if (isLive()) {
-			if (completionError) {
-				if (reportPersistenceFailure) {
-					reportPersistenceFailure(completionError, task, undefined);
-				}
-			} else {
-				try {
-					if (reload) await reload();
-				} catch {
-					// reload is best-effort after durable failed completion.
-				}
+			if (completionError && reportPersistenceFailure) {
+				reportPersistenceFailure(completionError, task, undefined);
 			}
 			if (reportTaskFailure) reportTaskFailure(executeError, task);
 		}
@@ -301,9 +304,9 @@ async function runClaimedExecution(task, _claim, deps) {
 		return;
 	}
 
-	// Completion is durable. reload is best-effort and live-gated; its failure
-	// never reports task-failed and never downgrades to ok:false.
-	if (isLive() && reload) {
+	// Completion is durable. reload is best-effort and active-session-gated; its
+	// failure never reports task-failed and never downgrades to ok:false.
+	if (shouldReload() && reload) {
 		try {
 			await reload();
 		} catch {
