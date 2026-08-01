@@ -669,6 +669,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			} catch {
 				// reload is best-effort; rescheduleAll uses the in-memory mirror.
 			}
+			if (generation !== sessionGeneration || isShutdown) return;
 			rescheduleAll(ctx);
 			return;
 		}
@@ -683,6 +684,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			} catch {
 				// reload is best-effort.
 			}
+			if (generation !== sessionGeneration || isShutdown) return;
 			rescheduleAll(ctx);
 			return;
 		}

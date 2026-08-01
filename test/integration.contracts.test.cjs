@@ -682,3 +682,18 @@ test("all lease recovery paths re-check liveness after async reloads", () => {
 		/catch \{[\s\S]*?await reloadTasks\(\);[\s\S]*?if \(generation === sessionGeneration && !isShutdown\)[\s\S]*?armLeaseRecovery\(ctx\)/,
 	);
 });
+
+test("fireTask re-checks liveness after claim reloads", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const fireTask = source.slice(
+		source.indexOf("async function fireTask"),
+		source.indexOf("async function safeReleaseClaim"),
+	);
+	assert.equal(fireTask.match(/await reloadTasks\(\)/g)?.length, 2);
+	assert.equal(
+		fireTask.match(
+			/await reloadTasks\(\);[\s\S]*?catch \{[\s\S]*?\}[\s\S]*?if \(generation !== sessionGeneration \|\| isShutdown\) return;[\s\S]*?rescheduleAll\(ctx\)/g,
+		)?.length,
+		2,
+	);
+});
