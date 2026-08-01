@@ -684,3 +684,159 @@ test("an ownerless lock from a crash before owner metadata is recoverable", asyn
 		assert.doesNotThrow(() => JSON.parse(readFileSync(file, "utf8")));
 	});
 });
+
+// Atomic lock-release regression (release race, sibling of the reaper race).
+//
+// The ORIGINAL releaseLock did an ownership read of lockDir then an IN-PLACE
+// recursive fs.rm(lockDir). Between the ownership check and the completion of
+// the recursive rm, lockDir could be ACQUIRED by a new live owner. The old
+// owner's recursive rm would then delete the new owner's LIVE lock, allowing a
+// third contender to acquire concurrently with the new owner and lose updates.
+//
+// The fix replaces the in-place rm with: ownership check -> atomic rename of
+// lockDir to a unique TOKEN-BOUND release quarantine -> chmod -> verify moved
+// owner identity -> delete ONLY the release quarantine. After the rename,
+// lockDir is free for a new owner; the old owner's cleanup never touches
+// lockDir again. The releaseLockHook lets a deterministic test pause the old
+// owner AFTER the atomic rename and identity verify, BEFORE cleanup, which is
+// exactly the window the original race exploited.
+test("release renames lockDir to a release quarantine so a new owner can acquire mid-release", async () => {
+	await withTempDir(async (dir) => {
+		const file = join(dir, "tasks.json");
+		writeFileSync(file, serializeState([freshTask()]), { mode: 0o600 });
+		const lockDir = `${file}.lock`;
+
+		// Barrier: the old owner pauses AFTER the atomic rename to its release
+		// quarantine and AFTER the moved-owner identity verify, but BEFORE the
+		// quarantine cleanup. This is the precise window the original in-place
+		// recursive-rm race exploited (the old owner still "owned" lockDir per
+		// metadata while the rm was mid-flight).
+		let resumeRelease;
+		const releasePaused = new Promise((resolve) => {
+			resumeRelease = resolve;
+		});
+		let pausedInfo = null;
+		const releaseLockHook = async (info, phase) => {
+			if (phase === "before-cleanup") {
+				pausedInfo = info;
+				await releasePaused;
+			}
+		};
+
+		const storeA = createTaskStore({
+			filePath: file,
+			staleLockMs: 60000,
+			lockTimeoutMs: 8000,
+			releaseLockHook,
+		});
+		const aPromise = storeA
+			.transaction(async (tasks) => {
+				tasks.push({
+					id: "a_mutation",
+					action: "notify",
+					type: "once",
+					status: "pending",
+				});
+				return "a_result";
+			})
+			.then(
+				(result) => ({ ok: true, result }),
+				(error) => ({ ok: false, error: String(error?.message) }),
+			);
+
+		// Wait until A has renamed lockDir to its release quarantine and paused.
+		const pauseDeadline = Date.now() + 3000;
+		while (pausedInfo === null && Date.now() < pauseDeadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		assert.ok(pausedInfo, "old owner A must reach the before-cleanup phase");
+		assert.ok(
+			pausedInfo.releaseDir,
+			"the hook must surface the release quarantine path",
+		);
+		assert.ok(
+			existsSync(pausedInfo.releaseDir),
+			"the release quarantine must exist while the old owner is paused",
+		);
+		// lockDir must already be FREE (renamed away) so a new owner can acquire.
+		assert.equal(
+			existsSync(lockDir),
+			false,
+			"lockDir must be vacated by the atomic rename before cleanup",
+		);
+
+		// While A is still paused (mid-release), a NEW owner B acquires lockDir.
+		const bAcquiredMarker = join(dir, "b_acquired.marker");
+		const bReleaseMarker = join(dir, "b_release.marker");
+		const storeB = createTaskStore({
+			filePath: file,
+			staleLockMs: 60000,
+			lockTimeoutMs: 3000,
+		});
+		const bPromise = storeB.transaction(async (tasks) => {
+			writeFileSync(bAcquiredMarker, "held");
+			tasks.push({
+				id: "b_mutation",
+				action: "notify",
+				type: "once",
+				status: "pending",
+			});
+			const releaseDeadline = Date.now() + 5000;
+			while (!existsSync(bReleaseMarker) && Date.now() < releaseDeadline) {
+				await new Promise((r) => setTimeout(r, 20));
+			}
+			return "b_result";
+		});
+
+		// Wait until B has provably acquired the live lock.
+		const bAcquireDeadline = Date.now() + 3000;
+		while (!existsSync(bAcquiredMarker) && Date.now() < bAcquireDeadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		assert.ok(existsSync(bAcquiredMarker), "new owner B must acquire lockDir");
+
+		// A THIRD contender C must NOT be able to acquire while B legitimately
+		// holds the lock. If A's old in-place recursive rm had deleted B's live
+		// lock, lockDir would be gone and C would acquire immediately (lost
+		// update). C uses a SHORT timeout so this proves the lock is still held.
+		const storeC = createTaskStore({
+			filePath: file,
+			staleLockMs: 60000,
+			lockTimeoutMs: 300,
+		});
+		const cOut = await storeC
+			.transaction(async () => "c_result")
+			.then(
+				(result) => ({ ok: true, result }),
+				(error) => ({ ok: false, error: String(error?.message) }),
+			);
+		assert.equal(
+			cOut.ok,
+			false,
+			"C must NOT acquire the lock while B legitimately holds it (A must not have deleted it)",
+		);
+		assert.match(cOut.error || "", /lock|timeout/i);
+
+		// Resume A's cleanup. It must touch ONLY its release quarantine, never
+		// lockDir (now B's live lock). After resume, A's quarantine is deleted.
+		resumeRelease();
+		const aOut = await aPromise;
+		assert.equal(aOut.ok, true, "old owner A must complete its transaction");
+		assert.equal(
+			existsSync(pausedInfo.releaseDir),
+			false,
+			"A's release quarantine must be cleaned up after resume",
+		);
+
+		// Release B so it can commit.
+		writeFileSync(bReleaseMarker, "release");
+		const bOut = await bPromise;
+		assert.equal(bOut, "b_result", "new owner B must complete its transaction");
+
+		// B's mutation must be durable: A's cleanup must not have lost it.
+		const data = JSON.parse(readFileSync(file, "utf8"));
+		const ids = data.tasks.map((t) => t.id);
+		assert.ok(ids.includes("a_mutation"), "A's mutation must survive");
+		assert.ok(ids.includes("b_mutation"), "B's mutation must survive");
+	});
+});

@@ -256,6 +256,16 @@ function createTaskStore(options = {}) {
 		typeof options.staleReapHook === "function"
 			? options.staleReapHook
 			: undefined;
+	// Test-only hook for the RELEASE path: called (awaitable) during lock
+	// release so a deterministic test can pause the old owner AFTER the atomic
+	// rename of lockDir to its release quarantine (and AFTER the moved-owner
+	// identity verify) but BEFORE the quarantine cleanup. This is the exact
+	// window the original in-place recursive-rm release exploited: a new owner
+	// could acquire lockDir while the old owner's rm was still mid-flight.
+	const releaseLockHook =
+		typeof options.releaseLockHook === "function"
+			? options.releaseLockHook
+			: undefined;
 
 	/**
 	 * Deterministic, crash-safe tombstone name for an observed stale owner.
@@ -482,10 +492,93 @@ function createTaskStore(options = {}) {
 		}
 	}
 
+	/**
+	 * Release the lock owned by `lock` using an OWNERSHIP-SAFE, race-free
+	 * atomic quarantine. This replaces the old in-place recursive fs.rm(lockDir),
+	 * which had a release race: between the ownership read and the completion of
+	 * the recursive rm, lockDir could be ACQUIRED by a new live owner, and the
+	 * old owner's recursive rm would then delete the new owner's LIVE lock
+	 * (allowing a third contender to interleave writes and lose updates).
+	 *
+	 * Atomic, race-free release:
+	 *   1. Confirm ownership of the CURRENT lockDir (pid + token).
+	 *   2. ATOMICALLY rename lockDir -> a unique TOKEN-BOUND release quarantine.
+	 *      After this single rename lockDir is FREE for a new owner to acquire;
+	 *      the old owner never touches lockDir again.
+	 *   3. chmod the quarantine owner-only (0o700).
+	 *   4. Verify the MOVED quarantine owner still matches. On mismatch, PRESERVE
+	 *      the quarantine and warn (defense-in-depth; the ownership pre-check
+	 *      makes a mismatch essentially impossible). Never restore/revisit it.
+	 *   5. Delete ONLY the release quarantine. A cleanup failure only WARNS: the
+	 *      transaction is already committed and the lock is already released,
+	 *      so a leftover restrictive quarantine is a harmless stale artifact.
+	 *
+	 * ENOENT on the rename is benign (another release/reaper already vacated
+	 * lockDir); nothing is left to clean up. This never deletes or revisits
+	 * lockDir after the rename, and preserves the existing stale-tombstone
+	 * recovery semantics for dead locks.
+	 */
+	function releaseQuarantineNameFor(ownerToken) {
+		const key =
+			typeof ownerToken === "string" && ownerToken
+				? ownerToken
+				: `release-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+		return `${lockDir}.release-${String(key).replace(/[^a-zA-Z0-9]/g, "_")}`;
+	}
+
 	async function releaseLock(lock) {
 		const owner = await readLockOwner(lockDir);
-		if (owner?.pid === process.pid && owner?.token === lock.token) {
-			await fs.rm(lockDir, { recursive: true, force: true });
+		if (owner?.pid !== process.pid || owner?.token !== lock.token) return;
+
+		const releaseDir = releaseQuarantineNameFor(owner.token);
+		try {
+			await fs.rename(lockDir, releaseDir);
+		} catch (error) {
+			// lockDir is already gone: another release or a stale reaper vacated
+			// it. The lock is effectively released; nothing remains to clean up.
+			if (error.code === "ENOENT") return;
+			throw error;
+		}
+
+		// Ensure restrictive owner-only permissions survive the move.
+		await chmodOwnerOnly(releaseDir, 0o700);
+
+		// Verify the MOVED quarantine owner still matches. A mismatch is
+		// defense-in-depth; the pre-rename ownership check makes it essentially
+		// impossible. If it happens, PRESERVE the artifact at the release
+		// quarantine path and warn. Never restore, delete, or revisit lockDir.
+		let mismatch = false;
+		const quarantined = await readLockOwner(releaseDir);
+		if (
+			!quarantined ||
+			quarantined.token !== owner.token ||
+			Number(quarantined.pid) !== Number(owner.pid)
+		) {
+			mismatch = true;
+			onWarning(
+				`Scheduler lock release for ${lockDir} moved the lock to ${releaseDir}, but the quarantined owner did not match the releasing owner. The artifact remains preserved at ${releaseDir}; it was not deleted, moved, or restored.`,
+			);
+		}
+
+		// Optional test barrier: pause AFTER the atomic rename and identity
+		// verify, BEFORE cleanup. This is the window the original in-place
+		// recursive-rm race exploited (lockDir vacated but cleanup pending).
+		if (releaseLockHook)
+			await releaseLockHook({ releaseDir, mismatch }, "before-cleanup");
+
+		// Delete ONLY the release quarantine. lockDir is no longer this owner's
+		// concern (it was vacated by the rename and may already be a new live
+		// owner's lock). A cleanup failure only WARNS: the transaction is
+		// already committed and the lock is already released, so a leftover
+		// restrictive quarantine is a harmless stale artifact.
+		if (mismatch) return;
+		try {
+			await fs.rm(releaseDir, { recursive: true, force: true });
+		} catch (error) {
+			if (error.code === "ENOENT") return;
+			onWarning(
+				`Scheduler lock release cleaned up the lock for ${lockDir} but could not remove the release quarantine at ${releaseDir} (${error?.code ? error.code : "error"}); the transaction is already committed.`,
+			);
 		}
 	}
 
@@ -811,6 +904,7 @@ function createTaskStore(options = {}) {
 		// Exposed for targeted unit testing of the recovery seam only.
 		_reapStaleLock: reapStaleLock,
 		_tombstoneNameFor: tombstoneNameFor,
+		_releaseQuarantineNameFor: releaseQuarantineNameFor,
 	};
 }
 

@@ -454,6 +454,83 @@ const IS_WIN32 = process.platform === "win32";
 const NON_OWNER_WRITE_MASK = 0o022;
 
 /**
+ * Reject a policy path that is itself a symbolic link before opening it.
+ * O_NOFOLLOW is unavailable or ineffective on some platforms (notably
+ * Windows), so this explicit lstat check preserves the fail-closed contract.
+ * The opened descriptor remains the authority for file type/content checks.
+ */
+function validatePolicyPathBeforeOpen(policyPath) {
+	try {
+		const pathStat = fs.lstatSync(policyPath);
+		if (pathStat.isSymbolicLink()) {
+			return {
+				ok: false,
+				reason: `Scheduled execution policy file is a symlink (${policyPath}). Execution is disabled; replace it with a regular file.`,
+			};
+		}
+		return { ok: true, stat: pathStat };
+	} catch (error) {
+		if (
+			error &&
+			(error.code === "ENOENT" || error.code === "MODULE_NOT_FOUND")
+		) {
+			return { ok: false, absent: true };
+		}
+		return {
+			ok: false,
+			reason: `Scheduled execution policy file cannot be safely inspected (${policyPath}): ${error?.code ? error.code : error?.message ? error.message : "unknown error"}. Execution is disabled.`,
+		};
+	}
+}
+
+function policyFileIdentityMatches(pathStat, descriptorStat) {
+	return (
+		Number.isFinite(pathStat?.dev) &&
+		Number.isFinite(pathStat?.ino) &&
+		Number.isFinite(descriptorStat?.dev) &&
+		Number.isFinite(descriptorStat?.ino) &&
+		pathStat.dev === descriptorStat.dev &&
+		pathStat.ino === descriptorStat.ino
+	);
+}
+
+function validateOpenedPolicyIdentity(
+	policyPath,
+	preOpenStat,
+	postOpenStat,
+	descriptorStat,
+) {
+	if (
+		policyFileIdentityMatches(preOpenStat, descriptorStat) &&
+		policyFileIdentityMatches(postOpenStat, descriptorStat)
+	) {
+		return { ok: true };
+	}
+	return {
+		ok: false,
+		reason: `Scheduled execution policy file changed while being opened (${policyPath}). Execution is disabled; retry with a stable regular file.`,
+	};
+}
+
+/** Open and fstat a policy file, closing any acquired fd if fstat fails. */
+function openAndStatPolicyFile(fsSync, policyPath, flags) {
+	let fd;
+	try {
+		fd = fsSync.openSync(policyPath, flags);
+		return { fd, stat: fsSync.fstatSync(fd) };
+	} catch (error) {
+		if (fd !== undefined) {
+			try {
+				fsSync.closeSync(fd);
+			} catch {
+				// best-effort close while preserving the original open/fstat error
+			}
+		}
+		throw error;
+	}
+}
+
+/**
  * Result of attempting to load and validate the policy file.
  *
  *   { ok: true,  config }            -> file present, validated, parsed
@@ -465,29 +542,32 @@ const NON_OWNER_WRITE_MASK = 0o022;
  * is the only outcome of an unreadable/untrusted policy.
  *
  * TOCTOU-safe loading (lead review medium fix 5): the file is opened ONCE with
- * O_NOFOLLOW (where available) so a symlink swap between lstat and read cannot
- * substitute a different file. We fstat the OPEN FILE DESCRIPTOR (not the
- * path) and read JSON from that same fd, so the bytes validated are the bytes
- * parsed. On POSIX the policy PARENT DIRECTORY must also be owned by the
- * current user and not be group/world-writable, so an attacker cannot replace
- * the policy file by writing into its directory.
+ * O_NOFOLLOW where available, but flag presence is never trusted as proof of
+ * enforcement. Every platform binds both pre-open and post-open lstat identity
+ * to the OPEN FILE DESCRIPTOR, rejecting symlinks and replacements before the
+ * content is trusted. We fstat and read JSON from that same fd, so the bytes
+ * validated are the bytes parsed. On POSIX the policy PARENT DIRECTORY must
+ * also be owned by the current user and not be group/world-writable, so an
+ * attacker cannot replace the policy file by writing into its directory.
  */
 function loadPolicyConfig(filePath) {
 	const policyPath = asString(filePath);
 	if (!policyPath) return { ok: false, absent: true };
 
+	const preOpenPath = validatePolicyPathBeforeOpen(policyPath);
+	if (!preOpenPath.ok) return preOpenPath;
+
 	// Open the policy file once, without following symlinks where the platform
 	// supports O_NOFOLLOW. Using the fd for both fstat and read closes the
 	// lstat/read TOCTOU window: the file we validate is the file we parse.
 	const fsSync = fs;
-	const flags =
-		constants.O_RDONLY |
-		(typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0);
+	const noFollowFlag =
+		typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+	const flags = constants.O_RDONLY | noFollowFlag;
 	let fd;
 	let stat;
 	try {
-		fd = fsSync.openSync(policyPath, flags);
-		stat = fsSync.fstatSync(fd);
+		({ fd, stat } = openAndStatPolicyFile(fsSync, policyPath, flags));
 	} catch (error) {
 		if (
 			error &&
@@ -509,6 +589,19 @@ function loadPolicyConfig(filePath) {
 	}
 
 	try {
+		// Always repeat lstat after opening and bind BOTH path observations to the
+		// opened descriptor. O_NOFOLLOW may exist but be ineffective on a platform;
+		// identity binding, not flag presence, is the fail-closed authority.
+		const postOpenPath = validatePolicyPathBeforeOpen(policyPath);
+		if (!postOpenPath.ok) return postOpenPath;
+		const identity = validateOpenedPolicyIdentity(
+			policyPath,
+			preOpenPath.stat,
+			postOpenPath.stat,
+			stat,
+		);
+		if (!identity.ok) return identity;
+
 		// The policy file MUST be a regular file. fstat on the no-follow fd
 		// rejects symlinks (ELOOP above or non-regular here) as well as sockets,
 		// devices, pipes, and directories.
@@ -643,4 +736,7 @@ module.exports = {
 	isValidArgv,
 	normalizeConfig,
 	normalizeAllowEntry,
+	openAndStatPolicyFile,
+	validateOpenedPolicyIdentity,
+	validatePolicyPathBeforeOpen,
 };

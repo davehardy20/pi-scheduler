@@ -29,9 +29,13 @@ const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 
 const ROOT = join(__dirname, "..", "extensions", "scheduler");
-const { loadPolicyFromFile, loadPolicyConfig } = require(
-	join(ROOT, "execution-policy.cjs"),
-);
+const {
+	loadPolicyFromFile,
+	loadPolicyConfig,
+	openAndStatPolicyFile,
+	validateOpenedPolicyIdentity,
+	validatePolicyPathBeforeOpen,
+} = require(join(ROOT, "execution-policy.cjs"));
 
 const ALLOW_CONFIG = {
 	execution: {
@@ -211,6 +215,68 @@ test("a symlinked policy file is rejected as non-regular and fails closed", () =
 		assert.equal(decision.allowed, false);
 		assert.match(decision.reason || "", /regular|symlink|file/i);
 	});
+});
+
+test("pre-open validation rejects policy symlinks without relying on O_NOFOLLOW", () => {
+	withTempDirSync((dir) => {
+		const real = writePolicy(dir, ALLOW_CONFIG);
+		const link = join(dir, "scheduler-policy-link.json");
+		try {
+			symlinkSync(real, link);
+		} catch (error) {
+			if (error && /EPERM|EACCES/.test(error.code || "")) return;
+			throw error;
+		}
+
+		const validation = validatePolicyPathBeforeOpen(link);
+		assert.equal(validation.ok, false);
+		assert.equal(validation.absent, undefined);
+		assert.match(validation.reason || "", /symlink/i);
+	});
+});
+
+test("descriptor is closed when fstat fails after a successful open", () => {
+	const closed = [];
+	const fakeFs = {
+		openSync: () => 0,
+		fstatSync: () => {
+			throw new Error("fstat failed");
+		},
+		closeSync: (fd) => closed.push(fd),
+	};
+
+	assert.throws(
+		() => openAndStatPolicyFile(fakeFs, "policy.json", 0),
+		/fstat failed/,
+	);
+	assert.deepEqual(closed, [0], "fd 0 must be closed on fstat failure");
+});
+
+test("opened policy identity must match both pre-open and post-open path identities", () => {
+	const original = { dev: 1, ino: 10 };
+	const replacement = { dev: 1, ino: 20 };
+
+	assert.equal(
+		validateOpenedPolicyIdentity("policy.json", original, original, original)
+			.ok,
+		true,
+	);
+	assert.equal(
+		validateOpenedPolicyIdentity(
+			"policy.json",
+			original,
+			replacement,
+			replacement,
+		).ok,
+		false,
+		"replacement between pre-check and open must fail closed",
+	);
+	assert.equal(
+		validateOpenedPolicyIdentity("policy.json", original, original, replacement)
+			.ok,
+		false,
+		"ineffective no-follow with a swapped-back path must fail closed",
+	);
 });
 
 test("a malformed JSON policy file fails closed rather than widening", () => {
