@@ -29,9 +29,13 @@ const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 
 const ROOT = join(__dirname, "..", "extensions", "scheduler");
-const { loadPolicyFromFile, loadPolicyConfig } = require(
-	join(ROOT, "execution-policy.cjs"),
-);
+const {
+	loadPolicyFromFile,
+	loadPolicyConfig,
+	openAndStatPolicyFile,
+	validateOpenedPolicyIdentity,
+	validatePolicyPathBeforeOpen,
+} = require(join(ROOT, "execution-policy.cjs"));
 
 const ALLOW_CONFIG = {
 	execution: {
@@ -66,11 +70,16 @@ test("loadPolicyFromFile denies by default when the file is absent", () => {
 
 test("loadPolicyFromFile authorizes an allowlisted structured command", () => {
 	withTempDirSync((dir) => {
-		const file = writePolicy(dir, ALLOW_CONFIG);
+		const file = writePolicy(dir, {
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: dir }],
+			},
+		});
 		const policy = loadPolicyFromFile(file);
 		const decision = policy.decide({
 			task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-			cwd: "/repo",
+			cwd: dir,
 		});
 		assert.equal(decision.allowed, true);
 		assert.equal(decision.shell, false);
@@ -96,14 +105,14 @@ test("loadPolicyFromFile re-reads on every call: an edit takes effect immediatel
 		const file = writePolicy(dir, {
 			execution: {
 				enabled: true,
-				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: dir }],
 			},
 		});
 
 		// Initially allowed.
 		let decision = loadPolicyFromFile(file).decide({
 			task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-			cwd: "/repo",
+			cwd: dir,
 		});
 		assert.equal(decision.allowed, true);
 
@@ -121,7 +130,7 @@ test("loadPolicyFromFile re-reads on every call: an edit takes effect immediatel
 
 		decision = loadPolicyFromFile(file).decide({
 			task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-			cwd: "/repo",
+			cwd: dir,
 		});
 		assert.equal(
 			decision.allowed,
@@ -133,21 +142,26 @@ test("loadPolicyFromFile re-reads on every call: an edit takes effect immediatel
 
 test("loadPolicyFromFile re-reads on every call: removing the file reverts to deny-by-default", () => {
 	withTempDirSync((dir) => {
-		const file = writePolicy(dir, ALLOW_CONFIG);
+		const file = writePolicy(dir, {
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: dir }],
+			},
+		});
 		assert.equal(
 			loadPolicyFromFile(file).decide({
 				task: {
 					action: "shell",
 					command: { executable: "npm", argv: ["test"] },
 				},
-				cwd: "/repo",
+				cwd: dir,
 			}).allowed,
 			true,
 		);
 		rmSync(file, { force: true });
 		const decision = loadPolicyFromFile(file).decide({
 			task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-			cwd: "/repo",
+			cwd: dir,
 		});
 		assert.equal(decision.allowed, false);
 		assert.match(decision.reason || "", /default|disabled|opt-in/i);
@@ -203,6 +217,68 @@ test("a symlinked policy file is rejected as non-regular and fails closed", () =
 	});
 });
 
+test("pre-open validation rejects policy symlinks without relying on O_NOFOLLOW", () => {
+	withTempDirSync((dir) => {
+		const real = writePolicy(dir, ALLOW_CONFIG);
+		const link = join(dir, "scheduler-policy-link.json");
+		try {
+			symlinkSync(real, link);
+		} catch (error) {
+			if (error && /EPERM|EACCES/.test(error.code || "")) return;
+			throw error;
+		}
+
+		const validation = validatePolicyPathBeforeOpen(link);
+		assert.equal(validation.ok, false);
+		assert.equal(validation.absent, undefined);
+		assert.match(validation.reason || "", /symlink/i);
+	});
+});
+
+test("descriptor is closed when fstat fails after a successful open", () => {
+	const closed = [];
+	const fakeFs = {
+		openSync: () => 0,
+		fstatSync: () => {
+			throw new Error("fstat failed");
+		},
+		closeSync: (fd) => closed.push(fd),
+	};
+
+	assert.throws(
+		() => openAndStatPolicyFile(fakeFs, "policy.json", 0),
+		/fstat failed/,
+	);
+	assert.deepEqual(closed, [0], "fd 0 must be closed on fstat failure");
+});
+
+test("opened policy identity must match both pre-open and post-open path identities", () => {
+	const original = { dev: 1, ino: 10 };
+	const replacement = { dev: 1, ino: 20 };
+
+	assert.equal(
+		validateOpenedPolicyIdentity("policy.json", original, original, original)
+			.ok,
+		true,
+	);
+	assert.equal(
+		validateOpenedPolicyIdentity(
+			"policy.json",
+			original,
+			replacement,
+			replacement,
+		).ok,
+		false,
+		"replacement between pre-check and open must fail closed",
+	);
+	assert.equal(
+		validateOpenedPolicyIdentity("policy.json", original, original, replacement)
+			.ok,
+		false,
+		"ineffective no-follow with a swapped-back path must fail closed",
+	);
+});
+
 test("a malformed JSON policy file fails closed rather than widening", () => {
 	withTempDirSync((dir) => {
 		const file = join(dir, "scheduler-policy.json");
@@ -238,5 +314,48 @@ test("loadPolicyConfig reports a non-ok reason (not absent) for a group-writable
 		assert.equal(loaded.ok, false);
 		assert.equal(loaded.absent, undefined);
 		assert.match(loaded.reason || "", /group|world|writable|chmod|600/i);
+	});
+});
+
+test("a policy file in a group-writable parent directory fails closed on POSIX", () => {
+	if (!POSIX) return;
+	withTempDirSync((parent) => {
+		// Create a dedicated subdirectory and make the PARENT group-writable so
+		// an attacker could swap the policy file into it.
+		const { mkdirSync, chmodSync } = require("node:fs");
+		const policyDir = join(parent, "policies");
+		mkdirSync(policyDir, { mode: 0o700 });
+		const file = join(policyDir, "scheduler-policy.json");
+		writeFileSync(file, `${JSON.stringify(ALLOW_CONFIG)}\n`, { mode: 0o600 });
+		chmodSync(policyDir, 0o770); // group-writable parent
+		try {
+			const loaded = loadPolicyConfig(file);
+			assert.equal(loaded.ok, false);
+			assert.match(
+				loaded.reason || "",
+				/directory|group|world|writable|chmod|700/i,
+			);
+		} finally {
+			chmodSync(policyDir, 0o700);
+		}
+	});
+});
+
+test("a policy file read via the no-follow fd is the file that was validated (symlink rejected)", () => {
+	// O_NOFOLLOW (where available) prevents opening a symlink at all; on
+	// platforms without it, the fstat non-regular / ELOOP path rejects it. Either
+	// way the symlinked policy must fail closed.
+	withTempDirSync((dir) => {
+		const real = writePolicy(dir, ALLOW_CONFIG);
+		const link = join(dir, "scheduler-policy-link.json");
+		try {
+			symlinkSync(real, link);
+		} catch (error) {
+			if (error && /EPERM|EACCES/.test(error.code || "")) return;
+			throw error;
+		}
+		const loaded = loadPolicyConfig(link);
+		assert.equal(loaded.ok, false);
+		assert.match(loaded.reason || "", /symlink|regular|file/i);
 	});
 });

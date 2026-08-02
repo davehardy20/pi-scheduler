@@ -16,7 +16,8 @@
 "use strict";
 
 const nodePath = require("node:path");
-const { lstatSync } = require("node:fs");
+const fs = require("node:fs");
+const { constants, realpathSync, statSync } = fs;
 
 // Fail-closed error reported when the policy file is missing or unreadable.
 // Distinct from an absent file (which is the normal deny-by-default state):
@@ -67,16 +68,58 @@ function normalizePath(value) {
 }
 
 /**
- * True when `child` is the same as, or nested beneath, `parent`. Both inputs
- * must already be normalized absolute paths. Containment treats the parent as
- * a directory boundary, so "/repo" contains "/repo" and "/repo/sub" but NOT
- * "/repository".
+ * Resolve a path to its REALPATH and require it to be an existing DIRECTORY.
+ * Returns the resolved absolute real path string, or null when the path is
+ * missing, not a directory, or cannot be resolved. Used for cwd containment
+ * so a symlink that escapes the root is rejected (no symlink-escape bypass)
+ * and a relative/nonexistent/non-directory root fails closed.
+ *
+ * realpath is used (not a string normalize) so containment is enforced against
+ * the TRUE filesystem location, defeating traversal/symlink tricks.
  */
-function isPathWithin(child, parent) {
+function resolveDirectory(value) {
+	const raw = asString(value).trim();
+	if (!raw) return null;
+	try {
+		const resolved = realpathSync(raw);
+		const stat = statSync(resolved);
+		if (!stat.isDirectory()) return null;
+		return resolved;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Select native path semantics for the target platform. The optional platform
+ * argument keeps Windows behavior testable from non-Windows development hosts.
+ */
+function pathApiForPlatform(platform = process.platform) {
+	return platform === "win32" ? nodePath.win32 : nodePath.posix;
+}
+
+/** Return whether a configured root is absolute for the target platform. */
+function isAbsoluteConfiguredPath(value, platform = process.platform) {
+	const raw = asString(value).trim();
+	if (!raw) return false;
+	return pathApiForPlatform(platform).isAbsolute(raw);
+}
+
+/**
+ * Both inputs must already be normalized absolute paths. Native relative-path
+ * semantics preserve Windows drive/UNC handling and enforce directory boundaries
+ * on every platform.
+ */
+function isPathWithin(child, parent, platform = process.platform) {
 	if (!child || !parent) return false;
-	if (child === parent) return true;
-	const prefix = parent.endsWith("/") ? parent : `${parent}/`;
-	return child.startsWith(prefix);
+	const pathApi = pathApiForPlatform(platform);
+	const relative = pathApi.relative(parent, child);
+	return (
+		relative === "" ||
+		(relative !== ".." &&
+			!relative.startsWith(`..${pathApi.sep}`) &&
+			!pathApi.isAbsolute(relative))
+	);
 }
 
 /**
@@ -115,7 +158,7 @@ function isValidArgv(value) {
  * malformed (the policy fails closed on any malformed entry by dropping it
  * from consideration; if that leaves no entries, execution is denied).
  */
-function normalizeAllowEntry(entry) {
+function normalizeAllowEntry(entry, platform = process.platform) {
 	if (!entry || typeof entry !== "object") return null;
 
 	if (!isValidExecutable(entry.executable)) return null;
@@ -129,12 +172,19 @@ function normalizeAllowEntry(entry) {
 	if (argvPrefix === null) return null;
 	if (!isValidArgv(argvPrefix)) return null;
 
-	const cwdRoot = normalizePath(entry.cwdRoot);
 	// cwdRoot is required: without it there is no containment boundary to
-	// enforce, so the entry cannot safely authorize any execution.
-	if (!cwdRoot) return null;
+	// enforce, so the entry cannot safely authorize any execution. It must be
+	// an ABSOLUTE path string; existence, directory-ness, and realpath
+	// containment are validated at decision time (fail closed) so a revoked
+	// or moved root is honored immediately.
+	const cwdRootRaw = asString(entry.cwdRoot).trim();
+	if (!isAbsoluteConfiguredPath(cwdRootRaw, platform)) return null;
 
-	return { executable, argvPrefix: argvPrefix.slice(), cwdRoot };
+	return {
+		executable,
+		argvPrefix: argvPrefix.slice(),
+		cwdRoot: cwdRootRaw,
+	};
 }
 
 /**
@@ -276,35 +326,54 @@ function createExecutionPolicy(config) {
 
 		// Validate the firing cwd against every candidate allow entry. An
 		// entry authorizes the command only when executable matches exactly,
-		// argv starts with the entry's argvPrefix, AND the normalized cwd is
-		// contained beneath the entry's cwdRoot.
+		// argv starts with the entry's argvPrefix, AND the REALPATH-resolved cwd
+		// is contained beneath the REALPATH-resolved cwdRoot. Both roots and the
+		// firing cwd must be absolute, existing DIRECTORIES; a symlink that
+		// escapes the root, or a nonexistent/non-directory/relative path, fails
+		// closed.
 		const requestedCwd = ctx && ctx.cwd !== undefined ? ctx.cwd : process.cwd();
-		const normalizedCwd = normalizePath(requestedCwd);
-		if (!normalizedCwd) {
+		const realCwd = resolveDirectory(requestedCwd);
+		if (realCwd === null) {
 			return deny(
-				"Scheduled shell task has no resolvable cwd; execution is disabled. Set a cwd contained beneath a configured cwdRoot.",
+				`Scheduled shell task cwd "${requestedCwd}" is not an existing directory; execution is disabled. Run beneath an allowlisted cwdRoot.`,
 			);
 		}
 
 		let cwdRejected = false;
+		let rootRejected = false;
 		for (const entry of allow) {
 			if (entry.executable !== executable) continue;
 			if (!startsWithPrefix(argv, entry.argvPrefix)) continue;
-			if (!isPathWithin(normalizedCwd, entry.cwdRoot)) {
+			// Resolve the entry's cwdRoot fresh each decision (no cache) so a
+			// moved/removed root is honored immediately.
+			const realRoot = resolveDirectory(entry.cwdRoot);
+			if (realRoot === null) {
+				rootRejected = true;
+				continue;
+			}
+			if (!isPathWithin(realCwd, realRoot)) {
 				// This entry would match except for cwd. Remember so we can
 				// surface a cwd-specific reason if no entry ultimately matches.
 				cwdRejected = true;
 				continue;
 			}
 			// Authorized: return literal argv for direct (no-shell) execution.
+			// Carry the verified real cwd so the runtime executes there (never
+			// the caller-supplied path that might traverse symlinks).
 			return {
 				allowed: true,
 				shell: false,
 				executable,
 				argv: [executable, ...argv],
+				cwd: realCwd,
 			};
 		}
 
+		if (rootRejected) {
+			return deny(
+				"A configured cwdRoot is not an existing directory; execution is disabled. Ensure cwdRoot entries point to existing absolute directories.",
+			);
+		}
 		if (cwdRejected) {
 			return deny(
 				`cwd "${requestedCwd}" is outside all configured cwdRoot values for this command; execution is disabled. Run beneath an allowlisted cwdRoot.`,
@@ -385,6 +454,83 @@ const IS_WIN32 = process.platform === "win32";
 const NON_OWNER_WRITE_MASK = 0o022;
 
 /**
+ * Reject a policy path that is itself a symbolic link before opening it.
+ * O_NOFOLLOW is unavailable or ineffective on some platforms (notably
+ * Windows), so this explicit lstat check preserves the fail-closed contract.
+ * The opened descriptor remains the authority for file type/content checks.
+ */
+function validatePolicyPathBeforeOpen(policyPath) {
+	try {
+		const pathStat = fs.lstatSync(policyPath);
+		if (pathStat.isSymbolicLink()) {
+			return {
+				ok: false,
+				reason: `Scheduled execution policy file is a symlink (${policyPath}). Execution is disabled; replace it with a regular file.`,
+			};
+		}
+		return { ok: true, stat: pathStat };
+	} catch (error) {
+		if (
+			error &&
+			(error.code === "ENOENT" || error.code === "MODULE_NOT_FOUND")
+		) {
+			return { ok: false, absent: true };
+		}
+		return {
+			ok: false,
+			reason: `Scheduled execution policy file cannot be safely inspected (${policyPath}): ${error?.code ? error.code : error?.message ? error.message : "unknown error"}. Execution is disabled.`,
+		};
+	}
+}
+
+function policyFileIdentityMatches(pathStat, descriptorStat) {
+	return (
+		Number.isFinite(pathStat?.dev) &&
+		Number.isFinite(pathStat?.ino) &&
+		Number.isFinite(descriptorStat?.dev) &&
+		Number.isFinite(descriptorStat?.ino) &&
+		pathStat.dev === descriptorStat.dev &&
+		pathStat.ino === descriptorStat.ino
+	);
+}
+
+function validateOpenedPolicyIdentity(
+	policyPath,
+	preOpenStat,
+	postOpenStat,
+	descriptorStat,
+) {
+	if (
+		policyFileIdentityMatches(preOpenStat, descriptorStat) &&
+		policyFileIdentityMatches(postOpenStat, descriptorStat)
+	) {
+		return { ok: true };
+	}
+	return {
+		ok: false,
+		reason: `Scheduled execution policy file changed while being opened (${policyPath}). Execution is disabled; retry with a stable regular file.`,
+	};
+}
+
+/** Open and fstat a policy file, closing any acquired fd if fstat fails. */
+function openAndStatPolicyFile(fsSync, policyPath, flags) {
+	let fd;
+	try {
+		fd = fsSync.openSync(policyPath, flags);
+		return { fd, stat: fsSync.fstatSync(fd) };
+	} catch (error) {
+		if (fd !== undefined) {
+			try {
+				fsSync.closeSync(fd);
+			} catch {
+				// best-effort close while preserving the original open/fstat error
+			}
+		}
+		throw error;
+	}
+}
+
+/**
  * Result of attempting to load and validate the policy file.
  *
  *   { ok: true,  config }            -> file present, validated, parsed
@@ -394,18 +540,34 @@ const NON_OWNER_WRITE_MASK = 0o022;
  * This NEVER throws: callers treat any non-ok result as deny-by-default so a
  * tampered or malformed policy file can never widen execution. A safe default
  * is the only outcome of an unreadable/untrusted policy.
+ *
+ * TOCTOU-safe loading (lead review medium fix 5): the file is opened ONCE with
+ * O_NOFOLLOW where available, but flag presence is never trusted as proof of
+ * enforcement. Every platform binds both pre-open and post-open lstat identity
+ * to the OPEN FILE DESCRIPTOR, rejecting symlinks and replacements before the
+ * content is trusted. We fstat and read JSON from that same fd, so the bytes
+ * validated are the bytes parsed. On POSIX the policy PARENT DIRECTORY must
+ * also be owned by the current user and not be group/world-writable, so an
+ * attacker cannot replace the policy file by writing into its directory.
  */
 function loadPolicyConfig(filePath) {
-	const path = asString(filePath);
-	if (!path) return { ok: false, absent: true };
+	const policyPath = asString(filePath);
+	if (!policyPath) return { ok: false, absent: true };
 
+	const preOpenPath = validatePolicyPathBeforeOpen(policyPath);
+	if (!preOpenPath.ok) return preOpenPath;
+
+	// Open the policy file once, without following symlinks where the platform
+	// supports O_NOFOLLOW. Using the fd for both fstat and read closes the
+	// lstat/read TOCTOU window: the file we validate is the file we parse.
+	const fsSync = fs;
+	const noFollowFlag =
+		typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+	const flags = constants.O_RDONLY | noFollowFlag;
+	let fd;
 	let stat;
 	try {
-		// lstat (NOT stat) so a SYMLINK is detected as itself rather than
-		// transparently following it. A symlinked policy could point anywhere on
-		// the filesystem (outside the user-owned state directory), so it is
-		// rejected outright below as non-regular.
-		stat = lstatSync(path);
+		({ fd, stat } = openAndStatPolicyFile(fsSync, policyPath, flags));
 	} catch (error) {
 		if (
 			error &&
@@ -413,66 +575,124 @@ function loadPolicyConfig(filePath) {
 		) {
 			return { ok: false, absent: true };
 		}
-		// Unreadable / permission denied / IO error: fail closed with a reason.
+		// ELOOP is raised on platforms with O_NOFOLLOW when the path is a symlink.
+		if (error && error.code === "ELOOP") {
+			return {
+				ok: false,
+				reason: `Scheduled execution policy file is a symlink (${policyPath}). Execution is disabled; replace it with a regular file.`,
+			};
+		}
 		return {
 			ok: false,
-			reason: `Scheduled execution policy file is not readable (${path}): ${error?.code ? error.code : error?.message ? error.message : "unknown error"}. Execution is disabled.`,
+			reason: `Scheduled execution policy file is not readable (${policyPath}): ${error?.code ? error.code : error?.message ? error.message : "unknown error"}. Execution is disabled.`,
 		};
 	}
 
-	// The policy file MUST be a regular file. lstatSync rejects symlinks (which
-	// could point outside the user-owned state directory) as well as sockets,
-	// devices, pipes, and directories. A non-regular file fails closed.
-	if (!stat.isFile()) {
-		return {
-			ok: false,
-			reason: `Scheduled execution policy file is not a regular file (${path}). Execution is disabled; remove or replace it with a regular file.`,
-		};
-	}
-
-	// POSIX ownership and mode validation. Skipped on Windows where Node does
-	// not expose a meaningful uid/gid and never applies UNIX permission bits.
-	if (!IS_WIN32 && HAS_POSIX_IDS) {
-		const ownerUid = process.getuid();
-
-		// The file MUST be owned by the current (real) user. A policy owned by
-		// root or another account could be altered by a shared-service user and
-		// is not a trustworthy privilege boundary for direct execution.
-		if (typeof stat.uid === "number" && stat.uid !== ownerUid) {
-			return {
-				ok: false,
-				reason: `Scheduled execution policy file is not owned by the current user (uid ${stat.uid}, expected ${ownerUid}) at ${path}. Execution is disabled; run 'chown "$USER" "${path}"' and 'chmod 600 "${path}"'.`,
-			};
-		}
-
-		// Reject group- or world-writable files outright. Anyone with group or
-		// world write could edit the allowlist to authorize arbitrary direct
-		// execution. Recommend chmod 600 in the actionable reason.
-		const mode = stat.mode & 0o777;
-		if ((mode & NON_OWNER_WRITE_MASK) !== 0) {
-			return {
-				ok: false,
-				reason: `Scheduled execution policy file is group- or world-writable (mode 0o${mode.toString(8).padStart(3, "0")}) at ${path}. Execution is disabled; run 'chmod 600 "${path}"'.`,
-			};
-		}
-	}
-
-	// Read and parse JSON. A syntax error fails closed rather than widening.
-	let config;
 	try {
-		// Inline require is avoided deliberately: require caches in
-		// require.cache and would defeat per-decision freshness. Read the bytes
-		// and JSON.parse every time so a revoked/edited policy is honored.
-		const raw = require("node:fs").readFileSync(path, "utf8");
-		config = JSON.parse(raw);
-	} catch (error) {
-		return {
-			ok: false,
-			reason: `Scheduled execution policy file is malformed JSON (${path}): ${error?.message ? error.message : "parse error"}. Execution is disabled.`,
-		};
-	}
+		// Always repeat lstat after opening and bind BOTH path observations to the
+		// opened descriptor. O_NOFOLLOW may exist but be ineffective on a platform;
+		// identity binding, not flag presence, is the fail-closed authority.
+		const postOpenPath = validatePolicyPathBeforeOpen(policyPath);
+		if (!postOpenPath.ok) return postOpenPath;
+		const identity = validateOpenedPolicyIdentity(
+			policyPath,
+			preOpenPath.stat,
+			postOpenPath.stat,
+			stat,
+		);
+		if (!identity.ok) return identity;
 
-	return { ok: true, config };
+		// The policy file MUST be a regular file. fstat on the no-follow fd
+		// rejects symlinks (ELOOP above or non-regular here) as well as sockets,
+		// devices, pipes, and directories.
+		if (!stat.isFile()) {
+			return {
+				ok: false,
+				reason: `Scheduled execution policy file is not a regular file (${policyPath}). Execution is disabled; remove or replace it with a regular file.`,
+			};
+		}
+
+		// POSIX ownership and mode validation of the OPEN FD. Skipped on Windows
+		// where Node does not expose a meaningful uid/gid and never applies UNIX
+		// permission bits.
+		if (!IS_WIN32 && HAS_POSIX_IDS) {
+			const ownerUid = process.getuid();
+
+			if (typeof stat.uid === "number" && stat.uid !== ownerUid) {
+				return {
+					ok: false,
+					reason: `Scheduled execution policy file is not owned by the current user (uid ${stat.uid}, expected ${ownerUid}) at ${policyPath}. Execution is disabled; run 'chown "$USER" "${policyPath}"' and 'chmod 600 "${policyPath}"'.`,
+				};
+			}
+
+			const mode = stat.mode & 0o777;
+			if ((mode & NON_OWNER_WRITE_MASK) !== 0) {
+				return {
+					ok: false,
+					reason: `Scheduled execution policy file is group- or world-writable (mode 0o${mode.toString(8).padStart(3, "0")}) at ${policyPath}. Execution is disabled; run 'chmod 600 "${policyPath}"'.`,
+				};
+			}
+
+			// Validate the PARENT directory too: it must be owned by the current
+			// user and not group/world-writable, so an attacker cannot replace the
+			// policy file by writing into its directory (rename/unlink swap).
+			const parentDirResult = validatePolicyParentDir(policyPath, ownerUid);
+			if (parentDirResult !== null) {
+				return { ok: false, reason: parentDirResult };
+			}
+		}
+
+		// Read and parse JSON FROM THE OPEN FD. A syntax error fails closed.
+		let config;
+		try {
+			const raw = fsSync.readFileSync(fd, "utf8");
+			config = JSON.parse(raw);
+		} catch (error) {
+			return {
+				ok: false,
+				reason: `Scheduled execution policy file is malformed JSON (${policyPath}): ${error?.message ? error.message : "parse error"}. Execution is disabled.`,
+			};
+		}
+
+		return { ok: true, config };
+	} finally {
+		try {
+			fsSync.closeSync(fd);
+		} catch {
+			// best-effort close
+		}
+	}
+}
+
+/**
+ * Validate the policy file's PARENT directory on POSIX: it must be owned by
+ * the current user and not group/world-writable. Without this, an attacker
+ * with write access to the directory could swap the policy file (rename/unlink)
+ * between validation and use. Returns null when OK, or a denial reason string.
+ */
+function validatePolicyParentDir(policyPath, ownerUid) {
+	const parent = nodePath.dirname(policyPath);
+	let dirStat;
+	try {
+		// stat (not lstat) is acceptable here: we are checking the real parent
+		// directory the kernel resolves for the policy path. A symlinked parent
+		// that points outside the user-owned state tree would still need to be
+		// user-owned and non-writable-by-group/world to pass.
+		dirStat = statSync(parent);
+	} catch (error) {
+		return `Scheduled execution policy directory is not accessible (${parent}): ${error?.code ? error.code : "error"}. Execution is disabled.`;
+	}
+	if (!dirStat.isDirectory()) {
+		return `Scheduled execution policy path parent (${parent}) is not a directory. Execution is disabled.`;
+	}
+	if (typeof dirStat.uid === "number" && dirStat.uid !== ownerUid) {
+		return `Scheduled execution policy directory (${parent}) is not owned by the current user (uid ${dirStat.uid}, expected ${ownerUid}). Execution is disabled.`;
+	}
+	const dirMode = dirStat.mode & 0o777;
+	if ((dirMode & NON_OWNER_WRITE_MASK) !== 0) {
+		return `Scheduled execution policy directory (${parent}) is group- or world-writable (mode 0o${dirMode.toString(8).padStart(3, "0")}). Execution is disabled; run 'chmod 700 "${parent}"'.`;
+	}
+	return null;
 }
 
 /**
@@ -510,9 +730,13 @@ module.exports = {
 	migrateTask,
 	// Exported for targeted unit testing / reuse.
 	normalizePath,
+	isAbsoluteConfiguredPath,
 	isPathWithin,
 	isValidExecutable,
 	isValidArgv,
 	normalizeConfig,
 	normalizeAllowEntry,
+	openAndStatPolicyFile,
+	validateOpenedPolicyIdentity,
+	validatePolicyPathBeforeOpen,
 };

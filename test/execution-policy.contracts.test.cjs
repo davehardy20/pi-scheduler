@@ -15,6 +15,8 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { mkdtempSync, rmSync } = require("node:fs");
+const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 
 const POLICY_PATH = join(
@@ -27,6 +29,18 @@ const POLICY_PATH = join(
 
 function loadPolicy() {
 	return require(POLICY_PATH);
+}
+
+// The policy now resolves cwdRoot/cwd via realpath and requires them to be
+// existing directories, so policy tests use real temp dirs instead of
+// synthetic paths like /repo.
+function withTempDir(fn) {
+	const dir = mkdtempSync(join(tmpdir(), "pi-scheduler-policy-"));
+	try {
+		return fn(dir);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 }
 
 test("ExecutionPolicy module is importable", () => {
@@ -72,106 +86,124 @@ test("legacy command strings fail closed and are never silently parsed as shell"
 
 test("opted-in execution accepts structured argv and never invokes a shell", () => {
 	const { createExecutionPolicy } = loadPolicy();
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
-	});
+	withTempDir((repo) => {
+		const policy = createExecutionPolicy({
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+			},
+		});
 
-	const decision = policy.decide({
-		task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-		cwd: "/repo",
+		const decision = policy.decide({
+			task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
+			cwd: repo,
+		});
+		assert.equal(
+			decision.allowed,
+			true,
+			"structured argv matching the allowlist must be permitted",
+		);
+		// Contract: when allowed, the policy returns argv to run directly — no shell.
+		assert.deepEqual(decision.argv, ["npm", "test"]);
+		assert.equal(decision.shell, false, "execution must never invoke a shell");
+		assert.equal(decision.executable, "npm");
 	});
-	assert.equal(
-		decision.allowed,
-		true,
-		"structured argv matching the allowlist must be permitted",
-	);
-	// Contract: when allowed, the policy returns argv to run directly — no shell.
-	assert.deepEqual(decision.argv, ["npm", "test"]);
-	assert.equal(decision.shell, false, "execution must never invoke a shell");
-	assert.equal(decision.executable, "npm");
 });
 
 test("argv prefix not in the allowlist is rejected at scheduling", () => {
 	const { createExecutionPolicy } = loadPolicy();
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDir((repo) => {
+		const policy = createExecutionPolicy({
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+			},
+		});
+		const decision = policy.decide({
+			task: {
+				action: "shell",
+				command: { executable: "npm", argv: ["publish"] },
+			},
+			cwd: repo,
+		});
+		assert.equal(
+			decision.allowed,
+			false,
+			"argv not matching an allowlisted prefix must be rejected",
+		);
 	});
-	const decision = policy.decide({
-		task: {
-			action: "shell",
-			command: { executable: "npm", argv: ["publish"] },
-		},
-		cwd: "/repo",
-	});
-	assert.equal(
-		decision.allowed,
-		false,
-		"argv not matching an allowlisted prefix must be rejected",
-	);
 });
 
 test("executable not in the allowlist is rejected", () => {
 	const { createExecutionPolicy } = loadPolicy();
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDir((repo) => {
+		const policy = createExecutionPolicy({
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+			},
+		});
+		const decision = policy.decide({
+			task: {
+				action: "shell",
+				command: { executable: "bash", argv: ["test"] },
+			},
+			cwd: repo,
+		});
+		assert.equal(
+			decision.allowed,
+			false,
+			"non-allowlisted executables must be rejected",
+		);
 	});
-	const decision = policy.decide({
-		task: { action: "shell", command: { executable: "bash", argv: ["test"] } },
-		cwd: "/repo",
-	});
-	assert.equal(
-		decision.allowed,
-		false,
-		"non-allowlisted executables must be rejected",
-	);
 });
 
 test("cwd outside a configured root is rejected at firing", () => {
 	const { createExecutionPolicy } = loadPolicy();
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDir((repo) => {
+		withTempDir((elsewhere) => {
+			const policy = createExecutionPolicy({
+				execution: {
+					enabled: true,
+					allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+				},
+			});
+			const decision = policy.decide({
+				task: {
+					action: "shell",
+					command: { executable: "npm", argv: ["test"] },
+				},
+				cwd: elsewhere,
+			});
+			assert.equal(
+				decision.allowed,
+				false,
+				"cwd outside a configured root must be rejected",
+			);
+			assert.match(decision.reason || "", /cwd|root|outside/i);
+		});
 	});
-	const decision = policy.decide({
-		task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-		cwd: "/etc",
-	});
-	assert.equal(
-		decision.allowed,
-		false,
-		"cwd outside a configured root must be rejected",
-	);
-	assert.match(decision.reason || "", /cwd|root|outside/i);
 });
 
 test("cwd-root validation rejects traversal escapes", () => {
 	const { createExecutionPolicy } = loadPolicy();
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDir((repo) => {
+		const policy = createExecutionPolicy({
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+			},
+		});
+		const decision = policy.decide({
+			task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
+			cwd: join(repo, "..", "etc"),
+		});
+		assert.equal(
+			decision.allowed,
+			false,
+			"cwd traversal outside a root must be rejected",
+		);
 	});
-	const decision = policy.decide({
-		task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-		cwd: "/repo/../etc",
-	});
-	assert.equal(
-		decision.allowed,
-		false,
-		"cwd traversal outside a root must be rejected",
-	);
 });
 
 test("argv containing shell metacharacters is treated as data, not interpreted", () => {

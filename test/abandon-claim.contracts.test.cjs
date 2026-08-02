@@ -178,6 +178,74 @@ test("abandonClaimedTask recomputes nextRun for an interval task from now", asyn
 	});
 });
 
+test("abandonClaimedTask does not resurrect a task cancelled during the claim", async () => {
+	await withTempDir(async (dir) => {
+		const file = join(dir, "tasks.json");
+		writeFileSync(
+			file,
+			serializeState([dueTask({ type: "interval", intervalMs: 300000 })]),
+			{ mode: 0o600 },
+		);
+		const store = createTaskStore({ filePath: file });
+		const claim = await store.claimDueTask({
+			runnerId: "owner",
+			now: new Date(),
+			leaseMs: 60000,
+		});
+		await store.transaction((tasks) => {
+			const task = tasks.find((item) => item.id === "abandon_me");
+			task.status = "cancelled";
+			task.enabled = false;
+			task.nextRun = undefined;
+		});
+
+		const abandoned = await store.abandonClaimedTask({
+			taskId: "abandon_me",
+			runnerId: "owner",
+			claimToken: claim.claimToken,
+			now: new Date(),
+		});
+		assert.equal(abandoned.status, "cancelled");
+		assert.equal(abandoned.enabled, false);
+		assert.equal(abandoned.nextRun, undefined);
+		assert.equal(abandoned.claimToken, undefined);
+	});
+});
+
+test("abandonClaimedTask does not re-enable a task disabled during the claim", async () => {
+	await withTempDir(async (dir) => {
+		const file = join(dir, "tasks.json");
+		writeFileSync(
+			file,
+			serializeState([dueTask({ type: "interval", intervalMs: 300000 })]),
+			{ mode: 0o600 },
+		);
+		const store = createTaskStore({ filePath: file });
+		const claim = await store.claimDueTask({
+			runnerId: "owner",
+			now: new Date(),
+			leaseMs: 60000,
+		});
+		await store.transaction((tasks) => {
+			const task = tasks.find((item) => item.id === "abandon_me");
+			task.status = "pending";
+			task.enabled = false;
+			task.nextRun = undefined;
+		});
+
+		const abandoned = await store.abandonClaimedTask({
+			taskId: "abandon_me",
+			runnerId: "owner",
+			claimToken: claim.claimToken,
+			now: new Date(),
+		});
+		assert.equal(abandoned.status, "pending");
+		assert.equal(abandoned.enabled, false);
+		assert.equal(abandoned.nextRun, undefined);
+		assert.equal(abandoned.claimToken, undefined);
+	});
+});
+
 test("abandonClaimedTask requires matching runner identity", async () => {
 	await withTempDir(async (dir) => {
 		const file = join(dir, "tasks.json");

@@ -35,6 +35,17 @@ async function withTempDir(fn) {
 	}
 }
 
+// The policy now resolves cwdRoot/cwd via realpath and requires them to be
+// existing directories, so policy tests use real temp dirs.
+function withTempDirSync(fn) {
+	const dir = mkdtempSync(join(tmpdir(), "pi-scheduler-policy-int-"));
+	try {
+		return fn(dir);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 function dueTask(overrides = {}) {
 	const due = new Date(Date.now() - 1000).toISOString();
 	return {
@@ -122,44 +133,56 @@ test("malformed policy config fails closed", () => {
 // ---------------------------------------------------------------------------
 
 test("firing-time revalidation refuses a structured command whose argv drifted", () => {
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDirSync((repo) => {
+		const policy = createExecutionPolicy({
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+			},
+		});
+		// At scheduling the command was allowed...
+		assert.equal(
+			policy.decide({
+				task: {
+					action: "shell",
+					command: { executable: "npm", argv: ["test"] },
+				},
+				cwd: repo,
+			}).allowed,
+			true,
+		);
+		// ...but at fire time the persisted command was changed to a disallowed argv.
+		const redecide = policy.decide({
+			task: {
+				action: "shell",
+				command: { executable: "npm", argv: ["publish"] },
+			},
+			cwd: repo,
+		});
+		assert.equal(redecide.allowed, false);
 	});
-	// At scheduling the command was allowed...
-	assert.equal(
-		policy.decide({
-			task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-			cwd: "/repo",
-		}).allowed,
-		true,
-	);
-	// ...but at fire time the persisted command was changed to a disallowed argv.
-	const redecide = policy.decide({
-		task: {
-			action: "shell",
-			command: { executable: "npm", argv: ["publish"] },
-		},
-		cwd: "/repo",
-	});
-	assert.equal(redecide.allowed, false);
 });
 
 test("firing-time revalidation refuses when cwd has moved outside the allowlist root", () => {
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDirSync((repo) => {
+		withTempDirSync((elsewhere) => {
+			const policy = createExecutionPolicy({
+				execution: {
+					enabled: true,
+					allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+				},
+			});
+			const decision = policy.decide({
+				task: {
+					action: "shell",
+					command: { executable: "npm", argv: ["test"] },
+				},
+				cwd: elsewhere,
+			});
+			assert.equal(decision.allowed, false);
+			assert.match(decision.reason || "", /cwd|root|outside/i);
+		});
 	});
-	const decision = policy.decide({
-		task: { action: "shell", command: { executable: "npm", argv: ["test"] } },
-		cwd: "/etc",
-	});
-	assert.equal(decision.allowed, false);
-	assert.match(decision.reason || "", /cwd|root|outside/i);
 });
 
 // ---------------------------------------------------------------------------
@@ -169,27 +192,29 @@ test("firing-time revalidation refuses when cwd has moved outside the allowlist 
 // ---------------------------------------------------------------------------
 
 test("allowed structured command runs directly without a shell", () => {
-	const policy = createExecutionPolicy({
-		execution: {
-			enabled: true,
-			allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" }],
-		},
+	withTempDirSync((repo) => {
+		const policy = createExecutionPolicy({
+			execution: {
+				enabled: true,
+				allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: repo }],
+			},
+		});
+		const decision = policy.decide({
+			task: {
+				action: "shell",
+				command: { executable: "npm", argv: ["test", "--silent"] },
+			},
+			cwd: repo,
+		});
+		assert.equal(decision.allowed, true);
+		assert.equal(decision.shell, false, "execution must never invoke a shell");
+		assert.equal(decision.executable, "npm");
+		// The returned argv is the literal program + args, suitable for direct exec.
+		assert.deepEqual(decision.argv, ["npm", "test", "--silent"]);
+		// Sanity: the executable is never "bash" and no element is "-lc".
+		assert.notEqual(decision.executable, "bash");
+		assert.ok(!decision.argv.includes("-lc"), "must never pass -lc to a shell");
 	});
-	const decision = policy.decide({
-		task: {
-			action: "shell",
-			command: { executable: "npm", argv: ["test", "--silent"] },
-		},
-		cwd: "/repo",
-	});
-	assert.equal(decision.allowed, true);
-	assert.equal(decision.shell, false, "execution must never invoke a shell");
-	assert.equal(decision.executable, "npm");
-	// The returned argv is the literal program + args, suitable for direct exec.
-	assert.deepEqual(decision.argv, ["npm", "test", "--silent"]);
-	// Sanity: the executable is never "bash" and no element is "-lc".
-	assert.notEqual(decision.executable, "bash");
-	assert.ok(!decision.argv.includes("-lc"), "must never pass -lc to a shell");
 });
 
 test("legacy command string migration preserves text but never auto-executes", () => {
@@ -537,9 +562,7 @@ test("lifecycle recovery: policy revocation between scheduling and firing is hon
 			`${JSON.stringify({
 				execution: {
 					enabled: true,
-					allow: [
-						{ executable: "npm", argvPrefix: ["test"], cwdRoot: "/repo" },
-					],
+					allow: [{ executable: "npm", argvPrefix: ["test"], cwdRoot: dir }],
 				},
 			})}\n`,
 			{ mode: 0o600 },
@@ -556,7 +579,7 @@ test("lifecycle recovery: policy revocation between scheduling and firing is hon
 				JSON.parse(readFileSync(policyFile, "utf8")),
 			).decide({
 				task,
-				cwd: "/repo",
+				cwd: dir,
 			}).allowed,
 			true,
 		);
@@ -572,7 +595,7 @@ test("lifecycle recovery: policy revocation between scheduling and firing is hon
 		const { loadPolicyFromFile } = require(join(ROOT, "execution-policy.cjs"));
 		const decision = loadPolicyFromFile(policyFile).decide({
 			task,
-			cwd: "/repo",
+			cwd: dir,
 		});
 		assert.equal(
 			decision.allowed,
@@ -612,4 +635,130 @@ test("lifecycle recovery: a group-writable policy file fails closed at fire time
 		assert.equal(decision.allowed, false);
 		assert.match(decision.reason || "", /group|world|writable|chmod|600/i);
 	});
+});
+
+test("index.ts wires fireTask execution settle through runClaimedExecution", () => {
+	// MEDIUM fix: replace brittle source-regex contracts with a single minimal
+	// wiring assertion proving index.ts delegates the fire-time settle to the
+	// behavioral helper. The full behavior (success-after-shutdown, execute
+	// rejection after shutdown, success-completion-throws, reload-throws) is
+	// covered behaviorally in scheduler-runtime.contracts.test.cjs via injected
+	// fakes, so a wording change in index.ts no longer risks a false failure.
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	assert.ok(
+		/runtime\.runClaimedExecution\(/.test(source),
+		"fireTask must settle claimed execution through runtime.runClaimedExecution",
+	);
+});
+
+test("index.ts refreshes the active successor after an older execution settles", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	assert.match(source, /shouldReload: \(\) => !isShutdown/);
+	assert.match(
+		source,
+		/await reloadTasks\(\);[\s\S]*?generation !== sessionGeneration && !isShutdown[\s\S]*?rescheduleAll\(\)/,
+	);
+});
+
+test("shell completion avoids stale-session messages after async execution", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const executeTask = source.slice(
+		source.indexOf("async function executeTask"),
+		source.indexOf("function sleep"),
+	);
+	assert.match(
+		executeTask,
+		/const result = await pi\.exec[\s\S]*?if \(isLive\(\)\) \{[\s\S]*?recordMessage\([\s\S]*?sendAgentPrompt\(/,
+	);
+	assert.match(
+		source,
+		/executeTask\([\s\S]*?\(\) => generation === sessionGeneration && !isShutdown/,
+	);
+});
+
+test("lease recovery refreshes persisted state before rearming an empty sweep", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const emptyBranch = source.match(
+		/if \(expired\.length === 0\) \{([\s\S]*?)\n\t\t\t\}/,
+	);
+	assert.ok(emptyBranch, "empty lease-recovery branch must exist");
+	assert.match(emptyBranch[1], /await reloadTasks\(\)/);
+	assert.match(emptyBranch[1], /rescheduleAll\(ctx\)/);
+	assert.match(
+		emptyBranch[1],
+		/await reloadTasks\(\);[\s\S]*if \(generation === sessionGeneration && !isShutdown\)[\s\S]*rescheduleAll\(ctx\)/,
+		"shutdown/generation must be re-checked after reload before rescheduling",
+	);
+	assert.doesNotMatch(emptyBranch[1], /armLeaseRecovery\(ctx\)/);
+});
+
+test("all lease recovery paths re-check liveness after async reloads", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const recovery = source.slice(
+		source.indexOf("async function recoverExpiredLeases"),
+		source.indexOf("function recordMessage"),
+	);
+	assert.match(
+		recovery,
+		/for \(const task of expired\)[\s\S]*?refreshActiveSessionAfterMutation\(generation, ctx\)/,
+	);
+	assert.match(
+		recovery,
+		/catch \{[\s\S]*?await reloadTasks\(\);[\s\S]*?if \(generation === sessionGeneration && !isShutdown\)[\s\S]*?armLeaseRecovery\(ctx\)/,
+	);
+});
+
+test("stale claim abandonment refreshes the active successor session", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const recovery = source.slice(
+		source.indexOf("async function recoverExpiredLeases"),
+		source.indexOf("function recordMessage"),
+	);
+	assert.match(
+		recovery,
+		/safeReleaseClaim\([\s\S]*?refreshActiveSessionAfterMutation\(generation, ctx\)/,
+	);
+	const fireTask = source.slice(
+		source.indexOf("async function fireTask"),
+		source.indexOf("const task = claimed.task"),
+	);
+	assert.match(
+		fireTask,
+		/safeReleaseClaim\([\s\S]*?refreshActiveSessionAfterMutation\(generation, ctx\)/,
+	);
+});
+
+test("fireTask re-checks liveness after claim reloads", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const fireTask = source.slice(
+		source.indexOf("async function fireTask"),
+		source.indexOf("async function safeReleaseClaim"),
+	);
+	const claimPreparation = fireTask.slice(
+		0,
+		fireTask.indexOf("const task = claimed.task"),
+	);
+	assert.equal(claimPreparation.match(/await reloadTasks\(\)/g)?.length, 2);
+	assert.equal(
+		claimPreparation.match(
+			/await reloadTasks\(\);[\s\S]*?catch \{[\s\S]*?\}[\s\S]*?if \(generation !== sessionGeneration \|\| isShutdown\) return;[\s\S]*?rescheduleAll\(ctx\)/g,
+		)?.length,
+		2,
+	);
+});
+
+test("claim reload failures use bounded delayed retries", () => {
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	assert.match(
+		source,
+		/function scheduleClaimRetry[\s\S]*?runtime\.claimFalseRearmDelay\(attempt\)/,
+	);
+	const claimFalse = source.slice(
+		source.indexOf("if (!claimed?.claimed)"),
+		source.indexOf("const task = claimed.task"),
+	);
+	assert.match(
+		claimFalse,
+		/catch[\s\S]*?scheduleClaimRetry\(taskId, ctx, generation, rearmAttempt\)/,
+	);
 });
