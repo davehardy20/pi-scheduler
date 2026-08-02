@@ -1,6 +1,7 @@
 const { promises: fs, constants } = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { loadCroner } = require("./scheduler-core.cjs");
 
 const DEFAULT_LOCK_TIMEOUT_MS = 5000;
 const DEFAULT_STALE_LOCK_MS = 30000;
@@ -794,7 +795,7 @@ function createTaskStore(options = {}) {
 		} else if (task.type === "cron") {
 			// Recompute the next cron run from now using croner, if available.
 			try {
-				const { Cron } = require("croner");
+				const { Cron } = loadCroner();
 				const cron = new Cron(task.schedule, { paused: true }, () => {});
 				const next = cron.nextRun(nowDate);
 				cron.stop();

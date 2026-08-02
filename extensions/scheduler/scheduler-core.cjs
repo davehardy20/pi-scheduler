@@ -975,6 +975,7 @@ module.exports = {
 	generateId,
 	createScheduledTask,
 	normalizeTask,
+	loadCroner,
 	sanitizeTasks,
 	pendingTasks,
 	dueTasks,
