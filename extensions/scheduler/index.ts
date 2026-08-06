@@ -1167,13 +1167,15 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		name: "schedule_task",
 		label: "Schedule Task",
 		description:
-			"Schedule a future or recurring action in this Pi session: notify the user, wake the agent with a prompt, run a shell command, or send a custom message.",
+			"Schedule a future or recurring action in this Pi session: notify the user, wake the agent with a prompt, run a shell command, or send a custom message. Use it to watch a GitHub PR's CI, review comments, and mergeability until the PR is merged or closed.",
 		promptSnippet:
-			"Schedule future/recurring notify, prompt, shell, or message actions in the current Pi session",
+			"Schedule future/recurring notify, prompt, shell, or message actions, e.g. a bounded GitHub PR watch (CI/review/merge status) until merge",
 		promptGuidelines: [
 			"Use schedule_task when the user asks to do something later, when waiting on external systems such as CI/CD pipelines, or when the agent needs to wake itself up to continue work.",
+			"GitHub PR watch — arm this whenever you open a PR. Immediately after gh_safe pr_create, schedule a bounded prompt interval (action='prompt', type='interval', schedule~'6m', maxRuns~15, scoped to that PR number) that on each wake checks CI via gh_safe pr_checks, review/automated-review comments via gh_safe pr_review_view (and the Codex PR-comment skill), and mergeability via gh_safe pr_view, then acts: apply a minimal fix on a failed check, action any unresolved comment, or merge on green (squash). Keep polling until the PR is merged or closed; never leave a PR unwatched. Follow ~/.pi/agent/scheduler-rules.md (Rule 1).",
+			"For PR/CI/review monitoring use action='prompt' so all GitHub and Git access goes through gh_safe / git_safe and the Codex skill — do not schedule raw gh/git shell tasks.",
 			"Use schedule_task type='once' for one-shot work, type='interval' for repeated polling, and type='cron' for calendar-style schedules.",
-			"Prefer schedule_task action='shell' with followUpPrompt/failurePrompt when a fixed command should run later and its output should be reviewed by the agent.",
+			"Prefer schedule_task action='shell' with followUpPrompt/failurePrompt when a fixed, allowlisted command should run later and its output should be reviewed by the agent.",
 			"For bounded polling workflows, set maxRuns so interval tasks do not run forever.",
 		],
 		parameters: Type.Object({

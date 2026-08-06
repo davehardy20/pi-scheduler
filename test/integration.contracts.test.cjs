@@ -637,6 +637,26 @@ test("lifecycle recovery: a group-writable policy file fails closed at fire time
 	});
 });
 
+test("schedule_task prompt nudges agents to arm a bounded GitHub PR watch", () => {
+	// Behavioral guard: the schedule_task tool prompt must tell agents to watch
+	// a PR's CI, review comments, and mergeability until the PR is merged/closed,
+	// so a PR opened in a session is never left unmonitored (scheduler-rules
+	// Rule 1). Pin the key signal strings so this nudge cannot be silently
+	// weakened or removed.
+	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const tool = source.slice(
+		source.indexOf('name: "schedule_task"'),
+		source.indexOf('name: "list_scheduled_tasks"'),
+	);
+	assert.match(tool, /promptGuidelines/);
+	assert.match(tool, /gh_safe pr_create/);
+	assert.match(tool, /gh_safe pr_checks/);
+	assert.match(tool, /gh_safe pr_review_view/);
+	assert.match(tool, /gh_safe pr_view/);
+	assert.match(tool, /maxRuns/);
+	assert.match(tool, /scheduler-rules\.md/);
+});
+
 test("index.ts wires fireTask execution settle through runClaimedExecution", () => {
 	// MEDIUM fix: replace brittle source-regex contracts with a single minimal
 	// wiring assertion proving index.ts delegates the fire-time settle to the
