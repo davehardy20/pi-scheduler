@@ -19,7 +19,13 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { join } = require("node:path");
 
-const ENGINE_PATH = join(__dirname, "..", "extensions", "scheduler", "scheduler-engine.cjs");
+const ENGINE_PATH = join(
+	__dirname,
+	"..",
+	"extensions",
+	"scheduler",
+	"scheduler-engine.cjs",
+);
 
 // Flush the microtask queue a bounded number of times so async engine paths
 // triggered by a synchronous clock tick settle before assertions.
@@ -129,8 +135,15 @@ function createFakeStore(initial = []) {
 			t.claimRunnerId = runnerId;
 			t.claimToken = "tok";
 			t.claimGeneration = 1;
-			t.claimLeaseExpiresAt = new Date(Date.now() + (leaseMs || 60000)).toISOString();
-			return { claimed: true, task: { ...t }, claimToken: t.claimToken, claimGeneration: 1 };
+			t.claimLeaseExpiresAt = new Date(
+				Date.now() + (leaseMs || 60000),
+			).toISOString();
+			return {
+				claimed: true,
+				task: { ...t },
+				claimToken: t.claimToken,
+				claimGeneration: 1,
+			};
 		},
 		async abandonClaimedTask({ taskId }) {
 			this.abandonCalls.push({ taskId });
@@ -164,7 +177,11 @@ function createRunStub() {
 	return {
 		calls,
 		fn(task, claim, deps) {
-			calls.push({ taskId: task.id, claim, hasExecute: typeof deps?.execute === "function" });
+			calls.push({
+				taskId: task.id,
+				claim,
+				hasExecute: typeof deps?.execute === "function",
+			});
 			return Promise.resolve();
 		},
 	};
@@ -217,7 +234,12 @@ function bindDefaults(engine, { isInScope = () => true } = {}) {
 
 test("engine: claim-false where another runner now owns the task does not run or re-arm it", async () => {
 	const clock = createVirtualClock();
-	const store = createFakeStore([pendingTask({ id: "t1", nextRun: new Date(clock.ms() + 500).toISOString() })]);
+	const store = createFakeStore([
+		pendingTask({
+			id: "t1",
+			nextRun: new Date(clock.ms() + 500).toISOString(),
+		}),
+	]);
 	// Another runner claimed it: mark running, return claim-false.
 	store.nextClaim = ({ taskId }) => {
 		const t = store.tasks.find((x) => x.id === taskId);
@@ -246,7 +268,12 @@ test("engine: claim-false where another runner now owns the task does not run or
 
 test("engine: claim-false with a failing reload schedules a non-zero retry timer", async () => {
 	const clock = createVirtualClock();
-	const store = createFakeStore([pendingTask({ id: "t1", nextRun: new Date(clock.ms() + 500).toISOString() })]);
+	const store = createFakeStore([
+		pendingTask({
+			id: "t1",
+			nextRun: new Date(clock.ms() + 500).toISOString(),
+		}),
+	]);
 	store.nextClaim = { claimed: false };
 	const realTransaction = store.transaction.bind(store);
 	const run = createRunStub();
@@ -264,8 +291,14 @@ test("engine: claim-false with a failing reload schedules a non-zero retry timer
 
 	assert.equal(run.calls.length, 0, "run must not be invoked on claim-false");
 	const retry = clock.live().find((t) => t.dueAt > clock.ms());
-	assert.ok(retry, "a non-zero scheduleClaimRetry timer must be armed when reload fails");
-	assert.ok(retry.dueAt - clock.ms() > 0, "retry delay must be strictly positive (no zero-delay spin)");
+	assert.ok(
+		retry,
+		"a non-zero scheduleClaimRetry timer must be armed when reload fails",
+	);
+	assert.ok(
+		retry.dueAt - clock.ms() > 0,
+		"retry delay must be strictly positive (no zero-delay spin)",
+	);
 	store.transaction = realTransaction;
 });
 
@@ -291,7 +324,9 @@ test("engine: refresh arms a recovery sweep for an expired RUNNING lease and rec
 		const t = store.tasks.find((x) => x.id === taskId);
 		return {
 			claimed: true,
-			task: t ? { ...t, status: "running", claimToken: "new", claimGeneration: 1 } : null,
+			task: t
+				? { ...t, status: "running", claimToken: "new", claimGeneration: 1 }
+				: null,
 			claimToken: "new",
 			claimGeneration: 1,
 		};
@@ -302,7 +337,10 @@ test("engine: refresh arms a recovery sweep for an expired RUNNING lease and rec
 
 	await engine.refresh();
 	const claimBefore = store.claimCalls.length;
-	assert.ok(clock.live().length > 0, "a recovery timer must be armed for an expired lease");
+	assert.ok(
+		clock.live().length > 0,
+		"a recovery timer must be armed for an expired lease",
+	);
 
 	clock.setNow(clock.ms() + 1001);
 	clock.tick(); // recovery sweep fires
@@ -316,7 +354,11 @@ test("engine: refresh arms a recovery sweep for an expired RUNNING lease and rec
 		store.abandonCalls.some((c) => c.taskId === "t1"),
 		"reclaimed task must be abandoned to pending, never executed",
 	);
-	assert.equal(run.calls.length, 0, "a reclaimed task must NOT be executed by the reclaimer");
+	assert.equal(
+		run.calls.length,
+		0,
+		"a reclaimed task must NOT be executed by the reclaimer",
+	);
 });
 
 // ---------------------------------------------------------------------------
@@ -326,7 +368,12 @@ test("engine: refresh arms a recovery sweep for an expired RUNNING lease and rec
 
 test("engine: shutdown during an in-flight claim releases the claim without executing or rescheduling", async () => {
 	const clock = createVirtualClock();
-	const store = createFakeStore([pendingTask({ id: "t1", nextRun: new Date(clock.ms() + 500).toISOString() })]);
+	const store = createFakeStore([
+		pendingTask({
+			id: "t1",
+			nextRun: new Date(clock.ms() + 500).toISOString(),
+		}),
+	]);
 	const run = createRunStub();
 	let resolveClaim;
 	store.nextClaim = () =>
@@ -346,14 +393,23 @@ test("engine: shutdown during an in-flight claim releases the claim without exec
 	engine.shutdown();
 
 	// Now resolve the claim as acquired.
-	resolveClaim({ claimed: true, task: { ...pendingTask({ id: "t1" }) }, claimToken: "tok", claimGeneration: 1 });
+	resolveClaim({
+		claimed: true,
+		task: { ...pendingTask({ id: "t1" }) },
+		claimToken: "tok",
+		claimGeneration: 1,
+	});
 	await flush();
 
 	assert.ok(
 		store.abandonCalls.some((c) => c.taskId === "t1"),
 		"an acquired claim during shutdown must be released via abandon",
 	);
-	assert.equal(run.calls.length, 0, "run must NOT be invoked when shutdown lands during a claim");
+	assert.equal(
+		run.calls.length,
+		0,
+		"run must NOT be invoked when shutdown lands during a claim",
+	);
 });
 
 // ---------------------------------------------------------------------------
@@ -363,7 +419,12 @@ test("engine: shutdown during an in-flight claim releases the claim without exec
 
 test("engine: after shutdown, a due timer performs no work", async () => {
 	const clock = createVirtualClock();
-	const store = createFakeStore([pendingTask({ id: "t1", nextRun: new Date(clock.ms() + 500).toISOString() })]);
+	const store = createFakeStore([
+		pendingTask({
+			id: "t1",
+			nextRun: new Date(clock.ms() + 500).toISOString(),
+		}),
+	]);
 	const run = createRunStub();
 	const engine = buildEngine({ clock, store, run });
 	bindDefaults(engine);
@@ -376,7 +437,11 @@ test("engine: after shutdown, a due timer performs no work", async () => {
 	clock.tick();
 	await flush();
 
-	assert.equal(store.claimCalls.length, claimBefore, "post-shutdown timer must not claim");
+	assert.equal(
+		store.claimCalls.length,
+		claimBefore,
+		"post-shutdown timer must not claim",
+	);
 	assert.equal(run.calls.length, 0, "post-shutdown timer must not run");
 });
 
@@ -388,7 +453,11 @@ test("engine: after shutdown, a due timer performs no work", async () => {
 
 test("engine: an out-of-scope claimed task is abandoned to pending without firing", async () => {
 	const clock = createVirtualClock();
-	const task = pendingTask({ id: "t1", scope: "session", nextRun: new Date(clock.ms() + 500).toISOString() });
+	const task = pendingTask({
+		id: "t1",
+		scope: "session",
+		nextRun: new Date(clock.ms() + 500).toISOString(),
+	});
 	const store = createFakeStore([task]);
 	const run = createRunStub();
 	const engine = buildEngine({ clock, store, run });
@@ -411,10 +480,22 @@ test("engine: an out-of-scope claimed task is abandoned to pending without firin
 		store.abandonCalls.some((c) => c.taskId === "t1"),
 		"an out-of-scope claimed task must be abandoned",
 	);
-	assert.equal(run.calls.length, 0, "an out-of-scope task must NOT be executed");
+	assert.equal(
+		run.calls.length,
+		0,
+		"an out-of-scope task must NOT be executed",
+	);
 	const settled = store.tasks.find((x) => x.id === "t1");
-	assert.equal(settled.status, "pending", "out-of-scope task must be restored to pending");
-	assert.equal(settled.runCount, 0, "runCount must not increment for an abandoned task");
+	assert.equal(
+		settled.status,
+		"pending",
+		"out-of-scope task must be restored to pending",
+	);
+	assert.equal(
+		settled.runCount,
+		0,
+		"runCount must not increment for an abandoned task",
+	);
 });
 
 // ---------------------------------------------------------------------------
@@ -425,7 +506,9 @@ test("engine: an out-of-scope claimed task is abandoned to pending without firin
 test("engine: a one-shot timer firing before dueAt re-arms instead of claiming", async () => {
 	const clock = createVirtualClock();
 	const farFuture = new Date(clock.ms() + 5000).toISOString();
-	const store = createFakeStore([pendingTask({ id: "t1", type: "once", nextRun: farFuture })]);
+	const store = createFakeStore([
+		pendingTask({ id: "t1", type: "once", nextRun: farFuture }),
+	]);
 	const run = createRunStub();
 	const engine = buildEngine({ clock, store, run });
 	bindDefaults(engine);
@@ -436,7 +519,51 @@ test("engine: a one-shot timer firing before dueAt re-arms instead of claiming",
 	await flush();
 
 	assert.equal(fired, 1, "the capped one-shot timer must fire");
-	assert.equal(store.claimCalls.length, 0, "must NOT claim before the true due time");
+	assert.equal(
+		store.claimCalls.length,
+		0,
+		"must NOT claim before the true due time",
+	);
 	assert.equal(run.calls.length, 0, "must NOT run before the true due time");
-	assert.ok(clock.live().length > 0, "must re-arm a follow-up timer for the remaining delay");
+	assert.ok(
+		clock.live().length > 0,
+		"must re-arm a follow-up timer for the remaining delay",
+	);
+});
+
+// ---------------------------------------------------------------------------
+// (g) Re-arm after shutdown — a new session reuses this engine instance; bind()
+// must clear the shutdown flag so the engine schedules and fires again, while
+// the generation bumped at shutdown keeps stale continuations blocked.
+// ---------------------------------------------------------------------------
+
+test("engine: bind() re-arms after shutdown so a due task fires again", async () => {
+	const clock = createVirtualClock();
+	const store = createFakeStore([
+		pendingTask({
+			id: "t1",
+			nextRun: new Date(clock.ms() + 500).toISOString(),
+		}),
+	]);
+	const run = createRunStub();
+	const engine = buildEngine({ clock, store, run });
+	bindDefaults(engine);
+
+	await engine.refresh();
+	engine.shutdown();
+
+	// A new session reuses this engine instance: bind() must clear shutdown so
+	// the engine schedules and fires again (the prior generation stays bumped,
+	// blocking any stale continuation from the dead session).
+	bindDefaults(engine);
+	await engine.refresh();
+	clock.setNow(500);
+	clock.tick();
+	await flush();
+
+	assert.equal(
+		run.calls.length,
+		1,
+		"a task due after re-bind must fire and run",
+	);
 });

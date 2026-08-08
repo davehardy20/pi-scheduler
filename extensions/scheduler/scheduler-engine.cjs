@@ -90,6 +90,7 @@ function createEngine(options) {
 	async function refresh() {
 		if (isShutdown) return;
 		await reloadMirror();
+		if (isShutdown) return;
 		rescheduleAll();
 	}
 
@@ -150,6 +151,7 @@ function createEngine(options) {
 				}
 			});
 			await reloadMirror();
+			if (isShutdown) return;
 			rescheduleAll();
 		} catch {
 			// Best-effort: a cron parse failure must not crash the engine.
@@ -374,6 +376,7 @@ function createEngine(options) {
 			await safeReleaseClaim(task, claimed.claimToken);
 			if (generation === sessionGeneration && !isShutdown) {
 				await reloadMirror();
+				if (isShutdown) return;
 				rescheduleAll();
 			}
 			return;
@@ -394,7 +397,10 @@ function createEngine(options) {
 				{ taskId: task.id, runnerId, claimToken, claimGeneration },
 				{
 					execute: (t) =>
-						bound.execute(t, () => generation === sessionGeneration && !isShutdown),
+						bound.execute(
+							t,
+							() => generation === sessionGeneration && !isShutdown,
+						),
 					complete: async ({ result, ok }) => {
 						// Persist the outcome even if shutdown occurred while the action
 						// was running: the action may already have produced external side
@@ -414,7 +420,8 @@ function createEngine(options) {
 						await reloadMirror();
 						// If this execution belongs to an older generation, refresh and
 						// re-arm the currently active successor session.
-						if (generation !== sessionGeneration && !isShutdown) rescheduleAll();
+						if (generation !== sessionGeneration && !isShutdown)
+							rescheduleAll();
 					},
 					isLive: () => generation === sessionGeneration && !isShutdown,
 					shouldReload: () => !isShutdown,
@@ -434,10 +441,15 @@ function createEngine(options) {
 
 	function bind(deps) {
 		bound = deps;
+		// A new session reuses this engine instance (Pi emits session_start for
+		// the same factory closure after a session_shutdown). Re-arm it: the
+		// generation was bumped at shutdown, so stale continuations from the
+		// prior session stay blocked, while the new session may schedule again.
+		isShutdown = false;
 	}
 
 	function snapshot() {
-		return tasks;
+		return tasks.slice();
 	}
 
 	function shutdown() {

@@ -676,7 +676,7 @@ test("engine refreshes the active view after an older execution settles", () => 
 	assert.match(source, /shouldReload: \(\) => !isShutdown/);
 	assert.match(
 		source,
-		/await reloadMirror\(\);[\s\S]*?generation !== sessionGeneration && !isShutdown[\s\S]*?rescheduleAll\(\)/,
+		/reload: async \(\) => \{[\s\S]*?await reloadMirror\(\);[\s\S]*?generation !== sessionGeneration && !isShutdown\)[\s\S]*?rescheduleAll\(\);[\s\S]*?\},/,
 	);
 });
 
@@ -689,7 +689,7 @@ test("shell completion avoids stale-session messages after async execution", () 
 	const engineSrc = readFileSync(join(ROOT, "scheduler-engine.cjs"), "utf8");
 	assert.match(
 		indexSrc,
-		/const result = await pi\.exec[\s\S]*?if \(isLive\(\)\) \{[\s\S]*?recordMessage\([\s\S]*?sendAgentPrompt\(/,
+		/if \(isLive\(\)\) \{[\s\S]*?recordMessage\([\s\S]*?sendAgentPrompt\([\s\S]*?\n\t\t\t\}/,
 	);
 	assert.match(
 		engineSrc,
@@ -747,7 +747,7 @@ test("stale claim abandonment refreshes the active successor session", () => {
 	);
 	assert.match(
 		fireTask,
-		/safeReleaseClaim\([\s\S]*?reloadMirror\(\)[\s\S]*?rescheduleAll\(\)/,
+		/if \(bound && !bound\.isInScope\(task\)\) \{\s*await safeReleaseClaim\(task, claimed\.claimToken\);\s*if \(generation === sessionGeneration && !isShutdown\) \{\s*await reloadMirror\(\);\s*if \(isShutdown\) return;\s*rescheduleAll\(\);/,
 	);
 });
 
@@ -784,6 +784,6 @@ test("claim reload failures use bounded delayed retries", () => {
 	);
 	assert.match(
 		claimFalse,
-		/catch[\s\S]*?scheduleClaimRetry\(taskId, generation, rearmAttempt\)/,
+		/if \(reloaded\) rescheduleAll\(\);\s*else scheduleClaimRetry\(taskId, generation, rearmAttempt\)/,
 	);
 });
