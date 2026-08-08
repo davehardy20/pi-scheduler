@@ -731,23 +731,29 @@ test("all lease recovery paths re-check liveness after async reloads", () => {
 
 test("stale claim abandonment refreshes the active successor session", () => {
 	const source = readFileSync(join(ROOT, "scheduler-engine.cjs"), "utf8");
-	const recovery = source.slice(
-		source.indexOf("async function recoverExpiredLeases"),
-		source.indexOf("async function safeReleaseClaim"),
-	);
-	assert.match(
-		recovery,
-		/safeReleaseClaim\([\s\S]*?refreshAfterMutation\(generation\)/,
-	);
-	// Scope-out abandonment lives AFTER `const task = claimed.task` in fireTask,
-	// so slice through the firing guard to include it.
+	// Both abandonment sites in fireTask — the shutdown-during-claim branch and
+	// the scope-out branch — must release the claim and then re-arm the now
+	// pending task for the live (possibly successor) session via
+	// refreshAfterMutation, matching the original refreshActiveSessionAfterMutation
+	// successor refresh. Otherwise a claim in-flight across shutdown + rebind is
+	// stranded until lease recovery rather than being re-armed immediately.
 	const fireTask = source.slice(
 		source.indexOf("async function fireTask"),
-		source.indexOf("firing.add(task.id)"),
+		source.indexOf("function bind(deps)"),
 	);
+	// Shutdown-during-claim: release the stray claim, then refresh the
+	// (possibly successor) session view so the released task is re-armed.
 	assert.match(
 		fireTask,
-		/if \(bound && !bound\.isInScope\(task\)\) \{\s*await safeReleaseClaim\(task, claimed\.claimToken\);\s*if \(generation === sessionGeneration && !isShutdown\) \{\s*await reloadMirror\(\);\s*if \(isShutdown\) return;\s*rescheduleAll\(\);/,
+		/if \(generation !== sessionGeneration \|\| isShutdown\) \{[\s\S]*?await safeReleaseClaim\(claimed\.task, claimed\.claimToken\);[\s\S]*?await refreshAfterMutation\(generation\);/,
+		"shutdown-during-claim must refresh the active successor session",
+	);
+	// Scope-out: release the out-of-scope claim, then refresh the (possibly
+	// successor) session view so the released task is re-armed when eligible.
+	assert.match(
+		fireTask,
+		/if \(bound && !bound\.isInScope\(task\)\) \{[\s\S]*?await safeReleaseClaim\(task, claimed\.claimToken\);[\s\S]*?await refreshAfterMutation\(generation\);/,
+		"scope-out must refresh the active successor session",
 	);
 });
 

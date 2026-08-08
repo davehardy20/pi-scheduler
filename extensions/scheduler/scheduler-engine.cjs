@@ -324,10 +324,14 @@ function createEngine(options) {
 
 		// Shutdown may occur while claimDueTask is awaiting the store lock. Never
 		// execute after the generation changes. If this runner acquired the claim
-		// during that window, release it without completing or rescheduling.
+		// during that window, release it without completing, then re-arm the now
+		// pending task for a live successor session (generation bumped at shutdown,
+		// then bind cleared isShutdown) so it is not stranded until lease recovery.
+		// If still shut down, refreshAfterMutation is a no-op; recovery handles it.
 		if (generation !== sessionGeneration || isShutdown) {
 			if (claimed?.claimed) {
 				await safeReleaseClaim(claimed.task, claimed.claimToken);
+				await refreshAfterMutation(generation);
 			}
 			return;
 		}
@@ -374,11 +378,12 @@ function createEngine(options) {
 		// future eligible run — do NOT mark it fired.
 		if (bound && !bound.isInScope(task)) {
 			await safeReleaseClaim(task, claimed.claimToken);
-			if (generation === sessionGeneration && !isShutdown) {
-				await reloadMirror();
-				if (isShutdown) return;
-				rescheduleAll();
-			}
+			// Re-arm the now pending task for the live (possibly successor) session.
+			// refreshAfterMutation reloads + reschedules only when !isShutdown,
+			// matching the original refreshActiveSessionAfterMutation successor
+			// refresh; a task still out of scope for the successor is simply not
+			// armed by rescheduleAll and stays pending for a future eligible run.
+			await refreshAfterMutation(generation);
 			return;
 		}
 
