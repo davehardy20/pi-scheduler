@@ -657,118 +657,129 @@ test("schedule_task prompt nudges agents to arm a bounded GitHub PR watch", () =
 	assert.match(tool, /scheduler-rules\.md/);
 });
 
-test("index.ts wires fireTask execution settle through runClaimedExecution", () => {
-	// MEDIUM fix: replace brittle source-regex contracts with a single minimal
-	// wiring assertion proving index.ts delegates the fire-time settle to the
-	// behavioral helper. The full behavior (success-after-shutdown, execute
+test("index.ts wires the fire-time settle through runClaimedExecution into the engine", () => {
+	// After the scheduling-engine extraction, index.ts no longer contains
+	// fireTask; it injects runtime.runClaimedExecution as the engine's settle
+	// helper. The full settle behavior (success-after-shutdown, execute
 	// rejection after shutdown, success-completion-throws, reload-throws) is
-	// covered behaviorally in scheduler-runtime.contracts.test.cjs via injected
-	// fakes, so a wording change in index.ts no longer risks a false failure.
+	// covered behaviorally in scheduler-runtime.contracts.test.cjs, and the
+	// engine's own orchestration invariants in scheduler-engine.contracts.test.cjs.
 	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
 	assert.ok(
-		/runtime\.runClaimedExecution\(/.test(source),
-		"fireTask must settle claimed execution through runtime.runClaimedExecution",
+		/run:\s*runtime\.runClaimedExecution/.test(source),
+		"index.ts must inject runtime.runClaimedExecution as the engine settle helper",
 	);
 });
 
-test("index.ts refreshes the active successor after an older execution settles", () => {
-	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+test("engine refreshes the active view after an older execution settles", () => {
+	const source = readFileSync(join(ROOT, "scheduler-engine.cjs"), "utf8");
 	assert.match(source, /shouldReload: \(\) => !isShutdown/);
 	assert.match(
 		source,
-		/await reloadTasks\(\);[\s\S]*?generation !== sessionGeneration && !isShutdown[\s\S]*?rescheduleAll\(\)/,
+		/reload: async \(\) => \{[\s\S]*?await reloadMirror\(\);[\s\S]*?generation !== sessionGeneration && !isShutdown\)[\s\S]*?rescheduleAll\(\);[\s\S]*?\},/,
 	);
 });
 
 test("shell completion avoids stale-session messages after async execution", () => {
-	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
-	const executeTask = source.slice(
-		source.indexOf("async function executeTask"),
-		source.indexOf("function sleep"),
+	// executeTask (still in index.ts) gates completion reporting on isLive().
+	// The engine passes a LIVE-UPDATING isLive closure that re-checks its own
+	// generation/shutdown at completion time, so a stale session that replaced
+	// (or shut down after) the in-flight execution never receives the message.
+	const indexSrc = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const engineSrc = readFileSync(join(ROOT, "scheduler-engine.cjs"), "utf8");
+	assert.match(
+		indexSrc,
+		/if \(isLive\(\)\) \{[\s\S]*?recordMessage\([\s\S]*?sendAgentPrompt\([\s\S]*?\n\t\t\t\}/,
 	);
 	assert.match(
-		executeTask,
-		/const result = await pi\.exec[\s\S]*?if \(isLive\(\)\) \{[\s\S]*?recordMessage\([\s\S]*?sendAgentPrompt\(/,
-	);
-	assert.match(
-		source,
-		/executeTask\([\s\S]*?\(\) => generation === sessionGeneration && !isShutdown/,
+		engineSrc,
+		/execute\([\s\S]*?\(\) => generation === sessionGeneration && !isShutdown/,
 	);
 });
 
 test("lease recovery refreshes persisted state before rearming an empty sweep", () => {
-	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const source = readFileSync(join(ROOT, "scheduler-engine.cjs"), "utf8");
 	const emptyBranch = source.match(
 		/if \(expired\.length === 0\) \{([\s\S]*?)\n\t\t\t\}/,
 	);
 	assert.ok(emptyBranch, "empty lease-recovery branch must exist");
-	assert.match(emptyBranch[1], /await reloadTasks\(\)/);
-	assert.match(emptyBranch[1], /rescheduleAll\(ctx\)/);
+	assert.match(emptyBranch[1], /await reloadMirror\(\)/);
+	assert.match(emptyBranch[1], /rescheduleAll\(\)/);
 	assert.match(
 		emptyBranch[1],
-		/await reloadTasks\(\);[\s\S]*if \(generation === sessionGeneration && !isShutdown\)[\s\S]*rescheduleAll\(ctx\)/,
+		/await reloadMirror\(\);[\s\S]*if \(generation === sessionGeneration && !isShutdown\)[\s\S]*rescheduleAll\(\)/,
 		"shutdown/generation must be re-checked after reload before rescheduling",
 	);
-	assert.doesNotMatch(emptyBranch[1], /armLeaseRecovery\(ctx\)/);
+	assert.doesNotMatch(emptyBranch[1], /armLeaseRecovery\(\)/);
 });
 
 test("all lease recovery paths re-check liveness after async reloads", () => {
-	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const source = readFileSync(join(ROOT, "scheduler-engine.cjs"), "utf8");
 	const recovery = source.slice(
 		source.indexOf("async function recoverExpiredLeases"),
-		source.indexOf("function recordMessage"),
+		source.indexOf("async function safeReleaseClaim"),
 	);
 	assert.match(
 		recovery,
-		/for \(const task of expired\)[\s\S]*?refreshActiveSessionAfterMutation\(generation, ctx\)/,
+		/for \(const task of expired\)[\s\S]*?refreshAfterMutation\(generation\)/,
 	);
 	assert.match(
 		recovery,
-		/catch \{[\s\S]*?await reloadTasks\(\);[\s\S]*?if \(generation === sessionGeneration && !isShutdown\)[\s\S]*?armLeaseRecovery\(ctx\)/,
+		/catch \{[\s\S]*?await reloadMirror\(\);[\s\S]*?if \(generation === sessionGeneration && !isShutdown\)[\s\S]*?armLeaseRecovery\(\)/,
 	);
 });
 
 test("stale claim abandonment refreshes the active successor session", () => {
-	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
-	const recovery = source.slice(
-		source.indexOf("async function recoverExpiredLeases"),
-		source.indexOf("function recordMessage"),
-	);
-	assert.match(
-		recovery,
-		/safeReleaseClaim\([\s\S]*?refreshActiveSessionAfterMutation\(generation, ctx\)/,
-	);
+	const source = readFileSync(join(ROOT, "scheduler-engine.cjs"), "utf8");
+	// Both abandonment sites in fireTask — the shutdown-during-claim branch and
+	// the scope-out branch — must release the claim and then re-arm the now
+	// pending task for the live (possibly successor) session via
+	// refreshAfterMutation, matching the original refreshActiveSessionAfterMutation
+	// successor refresh. Otherwise a claim in-flight across shutdown + rebind is
+	// stranded until lease recovery rather than being re-armed immediately.
 	const fireTask = source.slice(
 		source.indexOf("async function fireTask"),
-		source.indexOf("const task = claimed.task"),
+		source.indexOf("function bind(deps)"),
 	);
+	// Shutdown-during-claim: release the stray claim, then refresh the
+	// (possibly successor) session view so the released task is re-armed.
 	assert.match(
 		fireTask,
-		/safeReleaseClaim\([\s\S]*?refreshActiveSessionAfterMutation\(generation, ctx\)/,
+		/if \(generation !== sessionGeneration \|\| isShutdown\) \{[\s\S]*?await safeReleaseClaim\(claimed\.task, claimed\.claimToken\);[\s\S]*?await refreshAfterMutation\(generation\);/,
+		"shutdown-during-claim must refresh the active successor session",
+	);
+	// Scope-out: release the out-of-scope claim, then refresh the (possibly
+	// successor) session view so the released task is re-armed when eligible.
+	assert.match(
+		fireTask,
+		/if \(bound && !bound\.isInScope\(task\)\) \{[\s\S]*?await safeReleaseClaim\(task, claimed\.claimToken\);[\s\S]*?await refreshAfterMutation\(generation\);/,
+		"scope-out must refresh the active successor session",
 	);
 });
 
 test("fireTask re-checks liveness after claim reloads", () => {
-	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const source = readFileSync(join(ROOT, "scheduler-engine.cjs"), "utf8");
+	// In the engine, fireTask is defined AFTER its helpers (safeReleaseClaim,
+	// scheduleClaimRetry), so slice through the next top-level function (bind).
 	const fireTask = source.slice(
 		source.indexOf("async function fireTask"),
-		source.indexOf("async function safeReleaseClaim"),
+		source.indexOf("function bind(deps)"),
 	);
 	const claimPreparation = fireTask.slice(
 		0,
 		fireTask.indexOf("const task = claimed.task"),
 	);
-	assert.equal(claimPreparation.match(/await reloadTasks\(\)/g)?.length, 2);
+	assert.equal(claimPreparation.match(/await reloadMirror\(\)/g)?.length, 2);
 	assert.equal(
 		claimPreparation.match(
-			/await reloadTasks\(\);[\s\S]*?catch \{[\s\S]*?\}[\s\S]*?if \(generation !== sessionGeneration \|\| isShutdown\) return;[\s\S]*?rescheduleAll\(ctx\)/g,
+			/await reloadMirror\(\);[\s\S]*?catch \{[\s\S]*?\}[\s\S]*?if \(generation !== sessionGeneration \|\| isShutdown\) return;[\s\S]*?rescheduleAll\(\)/g,
 		)?.length,
 		2,
 	);
 });
 
 test("claim reload failures use bounded delayed retries", () => {
-	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
+	const source = readFileSync(join(ROOT, "scheduler-engine.cjs"), "utf8");
 	assert.match(
 		source,
 		/function scheduleClaimRetry[\s\S]*?runtime\.claimFalseRearmDelay\(attempt\)/,
@@ -779,6 +790,6 @@ test("claim reload failures use bounded delayed retries", () => {
 	);
 	assert.match(
 		claimFalse,
-		/catch[\s\S]*?scheduleClaimRetry\(taskId, ctx, generation, rearmAttempt\)/,
+		/if \(reloaded\) rescheduleAll\(\);\s*else scheduleClaimRetry\(taskId, generation, rearmAttempt\)/,
 	);
 });
