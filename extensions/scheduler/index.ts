@@ -34,6 +34,11 @@ const { createTaskStore } = require("./task-store.cjs");
 // writable mode on POSIX), re-parses it, and then evaluates. So a policy
 // revocation or edit takes effect at the next decision without a restart.
 const { loadPolicyFromFile, migrateTask } = require("./execution-policy.cjs");
+// Pi-free scheduling engine: owns the timer/rearm/lease-recovery/claim
+// lifecycle, extracted from this factory so its invariants are testable
+// without booting a full Pi process. execute/isInScope/reporting/UI-refresh
+// are bound from here; the engine never touches ExtensionContext.
+const { createEngine } = require("./scheduler-engine.cjs");
 
 const ACTIONS = ["notify", "prompt", "shell", "message"] as const;
 const TYPES = ["once", "interval", "cron"] as const;
@@ -59,9 +64,6 @@ const MIN_LEASE_MS = 30_000;
 const MAX_PROMPT_OUTPUT_CHARS = 18_000;
 
 type ScheduledTask = Record<string, any>;
-type TimerHandle =
-	| { kind: "timeout"; handle: NodeJS.Timeout }
-	| { kind: "cron"; handle: Cron };
 
 function truncateMiddle(text: string | undefined, maxChars: number): string {
 	const value = text ?? "";
@@ -155,21 +157,8 @@ function taskLabel(task: ScheduledTask): string {
 }
 
 export default function schedulerExtension(pi: ExtensionAPI) {
-	let tasks: ScheduledTask[] = [];
-	const handles = new Map<string, TimerHandle>();
 	let activeCtx: ExtensionContext | undefined;
 	let widgetEnabled = true;
-	const firing = new Set<string>();
-	// Session generation: bumped on session_shutdown so any in-flight fireTask can
-	// detect that the session has ended and refuse to reschedule/complete after
-	// shutdown (medium fix 6). A stale in-flight task that resolves after
-	// shutdown must not re-arm timers or mutate state.
-	let sessionGeneration = 0;
-	let isShutdown = false;
-	// Lease-expiry recovery timer: arms a single bounded sweep so persisted
-	// RUNNING tasks whose owners crashed are reclaimed after their leases
-	// expire (high fix 2). Re-armed on each reload/reschedule.
-	let recoveryTimer: NodeJS.Timeout | undefined;
 
 	// Stable, unique runner identity for this Pi process. Used as the claim owner
 	// so only the process that claimed a task can complete it; other processes
@@ -221,18 +210,23 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		return Math.max(MIN_LEASE_MS, base * 2 + LEASE_MARGIN_MS);
 	}
 
-	async function reloadTasks(): Promise<void> {
-		// Read-only transaction: acquire the lock, read current state, release.
-		// This guarantees the in-memory view is consistent with on-disk state.
-		// Legacy persisted shell tasks are migrated so a bare command string is
-		// preserved for display but flagged autoExecute:false (never run) until
-		// the user re-creates it with structured argv.
-		tasks = await taskStore.transaction((current: any[]) =>
+	// Pi-free scheduling engine: owns timers, rearm, lease-recovery, the claim
+	// lifecycle, and generation/shutdown gating. The store, lease-sizing,
+	// normalization, and settle half (runClaimedExecution) are injected;
+	// execute/isInScope/reporting/UI-refresh are bound from here so the engine
+	// never touches ExtensionContext.
+	const engine = createEngine({
+		store: taskStore,
+		runnerId,
+		clock: { now: () => new Date(), setTimeout, clearTimeout, Cron },
+		leaseMsForTask,
+		normalize: (current: any[]) =>
 			core
-				.sanitizeTasks(current.slice())
+				.sanitizeTasks(current)
 				.map((task: ScheduledTask) => migrateTask(task)),
-		);
-	}
+		run: runtime.runClaimedExecution,
+		maxTimerDelayMs: MAX_TIMER_DELAY_MS,
+	});
 
 	async function withTransaction<T>(
 		fn: (current: ScheduledTask[]) => T | Promise<T>,
@@ -247,26 +241,15 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			for (const task of normalized) current.push(task);
 			return ret;
 		});
-		// Mirror into memory after a successful commit.
-		await reloadTasks();
+		// Reload the engine mirror + reschedule + arm recovery after a commit.
+		await engine.refresh();
 		return result;
 	}
 
-	function clearHandle(id: string): void {
-		const handle = handles.get(id);
-		if (!handle) return;
-		if (handle.kind === "cron") handle.handle.stop();
-		else clearTimeout(handle.handle);
-		handles.delete(id);
-	}
-
-	function clearTimers(): void {
-		for (const id of [...handles.keys()]) clearHandle(id);
-	}
-
 	function visibleTasks(ctx = activeCtx): ScheduledTask[] {
-		if (!ctx) return tasks;
-		return tasks.filter((task) => taskBelongsToSession(task, ctx));
+		const all = engine.snapshot();
+		if (!ctx) return all;
+		return all.filter((task) => taskBelongsToSession(task, ctx));
 	}
 
 	function updateWidget(ctx = activeCtx): void {
@@ -304,166 +287,6 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		const count = core.pendingTasks(visibleTasks(ctx)).length;
 		ctx.ui.setStatus("scheduler", count ? `⏰ ${count} scheduled` : undefined);
 		updateWidget(ctx);
-	}
-
-	function scheduleTaskHandle(
-		task: ScheduledTask,
-		ctx: ExtensionContext,
-	): void {
-		if (task.enabled === false || task.status !== "pending") return;
-		if (!taskBelongsToSession(task, ctx)) return;
-		clearHandle(task.id);
-
-		if (task.type === "cron") {
-			try {
-				const cron = new Cron(task.schedule, () => {
-					void fireTask(task.id, ctx);
-				});
-				handles.set(task.id, { kind: "cron", handle: cron });
-			} catch (error: any) {
-				// Persist the failed cron parse through the store, not a bare save.
-				void withTransaction((current) => {
-					const failed = core.findTask(current, task.id);
-					if (failed) {
-						failed.enabled = false;
-						failed.status = "failed";
-						failed.lastStatus = "error";
-						failed.lastError = error?.message ?? String(error);
-					}
-				});
-			}
-			return;
-		}
-
-		const dueAt = Date.parse(task.nextRun ?? task.dueAt);
-		if (!Number.isFinite(dueAt)) return;
-		const delay = Math.max(0, dueAt - Date.now());
-		const timerDelay = Math.min(delay, MAX_TIMER_DELAY_MS);
-
-		const timer = setTimeout(() => {
-			handles.delete(task.id);
-			if (Date.now() < dueAt) {
-				scheduleTaskHandle(task, ctx);
-				return;
-			}
-			void fireTask(task.id, ctx);
-		}, timerDelay);
-		handles.set(task.id, { kind: "timeout", handle: timer });
-	}
-
-	function rescheduleAll(ctx = activeCtx): void {
-		if (!ctx) return;
-		clearTimers();
-		for (const task of core.pendingTasks(tasks)) scheduleTaskHandle(task, ctx);
-		updateStatus(ctx);
-		// Arm lease-expiry recovery for any persisted RUNNING task whose owner
-		// may have crashed, so it is reclaimed after its lease expires (high
-		// fix 2). This is bounded and non-zero: it never busy-loops.
-		armLeaseRecovery(ctx);
-	}
-
-	/**
-	 * Arm a single bounded lease-expiry recovery sweep. If a persisted task is
-	 * RUNNING with a resolvable lease, schedule one timer to fire just past its
-	 * expiry that reloads state and attempts to reclaim expired-lease tasks. A
-	 * crashed owner is thus reclaimed automatically. No-op when no running task
-	 * has a lease. Always uses a NON-ZERO delay (medium fix: no zero-delay
-	 * infinite rearm loop).
-	 */
-	function armLeaseRecovery(ctx: ExtensionContext): void {
-		if (isShutdown) return;
-		if (recoveryTimer) {
-			clearTimeout(recoveryTimer);
-			recoveryTimer = undefined;
-		}
-		const delay = runtime.nextLeaseRecoveryDelay(tasks, new Date(), {
-			maxDelayMs: MAX_TIMER_DELAY_MS,
-		});
-		if (delay === null) return;
-		recoveryTimer = setTimeout(() => {
-			recoveryTimer = undefined;
-			void recoverExpiredLeases(ctx);
-		}, delay);
-	}
-
-	async function refreshActiveSessionAfterMutation(
-		originGeneration: number,
-		originCtx: ExtensionContext,
-	): Promise<void> {
-		if (isShutdown) return;
-		try {
-			await reloadTasks();
-		} catch {
-			// A later active-session operation will retry the persisted reload.
-			return;
-		}
-		if (isShutdown) return;
-		rescheduleAll(
-			originGeneration === sessionGeneration ? originCtx : activeCtx,
-		);
-	}
-
-	/**
-	 * Reload state, find persisted RUNNING tasks with expired leases, and
-	 * reclaim them through the store so a crashed owner does not strand a task.
-	 * After reclaiming, reload + reschedule so the reclaimed task's next run is
-	 * armed. Guarded by the session generation so a sweep that fires after
-	 * shutdown does not mutate state.
-	 */
-	async function recoverExpiredLeases(ctx: ExtensionContext): Promise<void> {
-		if (isShutdown) return;
-		const generation = sessionGeneration;
-		try {
-			const current = await taskStore.transaction((snapshot: any[]) =>
-				snapshot.slice(),
-			);
-			const expired = runtime.tasksWithExpiredLeases(current, new Date());
-			if (expired.length === 0) {
-				if (generation === sessionGeneration && !isShutdown) {
-					// Another process may have completed/re-armed the task since this
-					// session loaded it. Refresh the in-memory mirror before rebuilding
-					// timers so stale running leases cannot create a recovery I/O loop
-					// or strand a recurring task that is now pending.
-					await reloadTasks();
-					if (generation === sessionGeneration && !isShutdown)
-						rescheduleAll(ctx);
-				}
-				return;
-			}
-			for (const task of expired) {
-				// Reclaim via a targeted claim; the store recovers the expired lease.
-				const claimed = await taskStore.claimDueTask({
-					runnerId,
-					taskId: task.id,
-					now: new Date(),
-					leaseMs: leaseMsForTask(task),
-				});
-				// We do NOT execute the reclaimed task here: an expired lease means
-				// the previous owner may still be finishing. Restore it to pending
-				// via abandon so the next eligible run picks it up cleanly.
-				if (claimed?.claimed) {
-					await safeReleaseClaim(
-						claimed.task as ScheduledTask,
-						claimed.claimToken,
-					);
-				}
-			}
-			await refreshActiveSessionAfterMutation(generation, ctx);
-		} catch {
-			// A transient store/claim failure must not strand an expired lease.
-			// Reload when possible, then re-arm from the current in-memory snapshot;
-			// nextLeaseRecoveryDelay applies a non-zero floor, so this retries
-			// without busy-looping.
-			if (generation === sessionGeneration && !isShutdown) {
-				try {
-					await reloadTasks();
-				} catch {
-					// Keep the prior snapshot; it still identifies the running lease.
-				}
-				if (generation === sessionGeneration && !isShutdown)
-					armLeaseRecovery(ctx);
-			}
-		}
 	}
 
 	function recordMessage(
@@ -602,263 +425,6 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		throw new Error(`Unsupported scheduled action: ${task.action}`);
 	}
 
-	// Bounded retry constants for the case where a one-shot timer has already
-	// removed its handle but the store claim failed (lock contention / transient
-	// error). Without a retry, the pending task would be stranded with no timer.
-	// We retry a few times with short backoff, then fall back to rescheduling
-	// the pending task (reload + rescheduleAll re-arms a timer) so the task is
-	// not lost; a later tick or another runner retries the claim.
-	const FIRE_CLAIM_RETRIES = 3;
-	const FIRE_CLAIM_RETRY_BASE_MS = 50;
-	const FIRE_CLAIM_RETRY_MAX_MS = 250;
-
-	function sleep(ms: number): Promise<void> {
-		return new Promise((resolve) => setTimeout(resolve, ms));
-	}
-
-	function scheduleClaimRetry(
-		taskId: string,
-		ctx: ExtensionContext,
-		generation: number,
-		attempt: number,
-	): void {
-		if (generation !== sessionGeneration || isShutdown) return;
-		clearHandle(taskId);
-		const delay = runtime.claimFalseRearmDelay(attempt);
-		const timer = setTimeout(() => {
-			handles.delete(taskId);
-			if (generation !== sessionGeneration || isShutdown) return;
-			void fireTask(taskId, ctx, attempt + 1);
-		}, delay);
-		handles.set(taskId, { kind: "timeout", handle: timer });
-	}
-
-	async function fireTask(
-		taskId: string,
-		ctx: ExtensionContext,
-		rearmAttempt = 0,
-	): Promise<void> {
-		// Claim the due task atomically through the store. Only the claim owner
-		// (matching runnerId + claimToken) is allowed to execute and complete.
-		// An expired lease (e.g. a crashed owner) is recovered by the store so a
-		// new runner can reclaim it on a later tick. The `firing` guard prevents
-		// the same process from racing two timers for the same task.
-		if (firing.has(taskId)) return;
-		// Capture the session generation at entry. If the session shuts down
-		// while this task is in flight, the generation bumps and we refuse to
-		// reschedule/complete after shutdown (medium fix 6).
-		const generation = sessionGeneration;
-		if (isShutdown) return;
-
-		// Use the in-memory mirror to size the lease to this task's execution
-		// timeout (with margin) before claiming, so a slow custom-timeout run is
-		// not stolen by another runner.
-		const known = tasks.find((candidate) => candidate.id === taskId);
-		const leaseMs = leaseMsForTask(
-			known ?? ({ timeoutMs: DEFAULT_SHELL_TIMEOUT_MS } as ScheduledTask),
-		);
-
-		// Claim with a BOUNDED retry path. A one-shot timer removes its handle
-		// BEFORE calling fireTask, so if the claim throws here the pending task
-		// would otherwise be stranded with no timer. Retry a few times for
-		// transient lock/contention failures; if all retries fail, re-arm a
-		// timer via rescheduleAll so the task is not lost.
-		let claimed: any;
-		let lastClaimError: any;
-		for (let attempt = 0; attempt <= FIRE_CLAIM_RETRIES; attempt++) {
-			try {
-				claimed = await taskStore.claimDueTask({
-					runnerId,
-					taskId,
-					now: new Date(),
-					leaseMs,
-				});
-				lastClaimError = undefined;
-				break;
-			} catch (error: any) {
-				lastClaimError = error;
-				if (attempt >= FIRE_CLAIM_RETRIES) break;
-				if (generation !== sessionGeneration || isShutdown) return;
-				const backoff = Math.min(
-					FIRE_CLAIM_RETRY_MAX_MS,
-					FIRE_CLAIM_RETRY_BASE_MS * 2 ** attempt,
-				);
-				await sleep(backoff);
-				if (generation !== sessionGeneration || isShutdown) return;
-			}
-		}
-
-		// Shutdown may occur while claimDueTask is awaiting the store lock. Never
-		// execute after the generation changes. If this runner acquired the claim
-		// during that window, release it without completing or rescheduling it.
-		if (generation !== sessionGeneration || isShutdown) {
-			if (claimed?.claimed) {
-				await safeReleaseClaim(
-					claimed.task as ScheduledTask,
-					claimed.claimToken,
-				);
-				await refreshActiveSessionAfterMutation(generation, ctx);
-			}
-			return;
-		}
-
-		if (lastClaimError) {
-			// All claim attempts failed. The one-shot timer already deleted its
-			// handle, so re-arm scheduling for pending tasks to avoid stranding
-			// this (and any other) due task. A later tick or another runner will
-			// retry the claim. Guarded by the generation so a shutdown during the
-			// claim retry does not re-arm after shutdown.
-			if (generation !== sessionGeneration || isShutdown) return;
-			let reloaded = false;
-			try {
-				await reloadTasks();
-				reloaded = true;
-			} catch {
-				// Retry with bounded backoff instead of immediately reusing stale state.
-			}
-			if (generation !== sessionGeneration || isShutdown) return;
-			if (reloaded) rescheduleAll(ctx);
-			else scheduleClaimRetry(taskId, ctx, generation, rearmAttempt);
-			return;
-		}
-		if (!claimed?.claimed) {
-			// Claim returned false (task already claimed by another runner, or not
-			// due). Reload and re-arm so a crashed owner is reclaimed after its
-			// lease expires (high fix 2). Use a bounded, NON-ZERO rearm so this
-			// does NOT spin in a zero-delay infinite loop (claim-error retry fix).
-			if (generation !== sessionGeneration || isShutdown) return;
-			let reloaded = false;
-			try {
-				await reloadTasks();
-				reloaded = true;
-			} catch {
-				// Retry with bounded backoff instead of immediately reusing stale state.
-			}
-			if (generation !== sessionGeneration || isShutdown) return;
-			if (reloaded) rescheduleAll(ctx);
-			else scheduleClaimRetry(taskId, ctx, generation, rearmAttempt);
-			return;
-		}
-
-		const task = claimed.task as ScheduledTask;
-		// Scope filter: only this session/cwd/global tasks fire here. If the claim
-		// was for a task outside our scope, abandon the claim (restore pending,
-		// no runCount bump) so the lease is cleared and the task stays pending
-		// for a future eligible run — do NOT mark it fired.
-		if (!taskBelongsToSession(task, ctx)) {
-			await safeReleaseClaim(task, claimed.claimToken);
-			await refreshActiveSessionAfterMutation(generation, ctx);
-			return;
-		}
-
-		firing.add(task.id);
-		const claimToken = claimed.claimToken;
-		const claimGeneration = claimed.claimGeneration;
-		// Settle the claimed execution lifecycle through the injectable helper so
-		// the policy concerns (only executeTask rejection may persist ok:false;
-		// success/result completion failure is never downgraded; reload failure
-		// after durable success is never task-failed) stay cohesive and testable
-		// with fakes (HIGH fix 1 + MEDIUM fix 2). The helper owns completion,
-		// live-gated reload, and failure/persistence reports; index's finally
-		// keeps the unconditional firing.delete and live-only rescheduleAll.
-		try {
-			updateStatus(ctx);
-			await runtime.runClaimedExecution(
-				task,
-				{ taskId: task.id, runnerId, claimToken, claimGeneration },
-				{
-					execute: (t: ScheduledTask) =>
-						executeTask(
-							t,
-							ctx,
-							() => generation === sessionGeneration && !isShutdown,
-						),
-					complete: async ({ result, ok }) => {
-						// Persist the outcome even if shutdown occurred while the
-						// action was running: the action may already have produced
-						// external side effects, and leaving its claim running would
-						// let lease recovery execute it again.
-						await taskStore.completeClaimedTask({
-							taskId: task.id,
-							runnerId,
-							claimToken,
-							claimGeneration,
-							result,
-							now: new Date(),
-							ok,
-						});
-					},
-					reload: async () => {
-						await reloadTasks();
-						// If this execution belongs to an older generation, refresh
-						// and re-arm the currently active successor session.
-						if (generation !== sessionGeneration && !isShutdown)
-							rescheduleAll();
-					},
-					isLive: () => generation === sessionGeneration && !isShutdown,
-					shouldReload: () => !isShutdown,
-					reportTaskFailure: (error: any) => {
-						const message = `Scheduled task ${task.id} failed: ${error?.message ?? String(error)}`;
-						if (ctx.hasUI) ctx.ui.notify(message, "error");
-						recordMessage(
-							`⚠️ ${message}`,
-							{
-								task: runtime.redactTaskForMessage(task),
-								error: error?.message ?? String(error),
-							},
-							false,
-						);
-					},
-					reportPersistenceFailure: (error: any) => {
-						// A success/result completion error is a DURABILITY problem,
-						// not a task failure: never surface it as task-failed.
-						const message = `Scheduled task ${task.id} completed but could not be persisted: ${error?.message ?? String(error)}`;
-						if (ctx.hasUI) ctx.ui.notify(message, "warning");
-						recordMessage(
-							`⚠️ ${message}`,
-							{
-								task: runtime.redactTaskForMessage(task),
-								persistenceError: error?.message ?? String(error),
-							},
-							false,
-						);
-					},
-				},
-			);
-		} finally {
-			firing.delete(task.id);
-			// Only reschedule if the session is still live (same generation). An
-			// in-flight fireTask that resolves after shutdown must not re-arm
-			// timers or mutate UI state.
-			if (generation === sessionGeneration && !isShutdown) rescheduleAll(ctx);
-		}
-	}
-
-	// Abandon a claim we should not execute (e.g. an out-of-scope task that
-	// this runner claimed) WITHOUT marking it fired. Uses the store's
-	// ownership/token-checked abandonClaimedTask: clears the claim metadata
-	// (runnerId/claimToken/lease) and restores the task to pending so a future
-	// eligible run can claim it again. runCount is NOT incremented because no
-	// execution happened. Only the claim owner may abandon its own claim.
-	async function safeReleaseClaim(
-		task: ScheduledTask,
-		claimToken: string,
-	): Promise<void> {
-		try {
-			await taskStore.abandonClaimedTask({
-				taskId: task.id,
-				runnerId,
-				claimToken,
-				now: new Date(),
-			});
-			await reloadTasks();
-		} catch {
-			// If abandon fails (e.g. lease already expired and reclaimed by a
-			// new runner that is in-scope), the store's lease recovery handles
-			// it. The task is not marked fired here under any path.
-		}
-	}
-
 	// Validate a shell task against the execution policy at scheduling time.
 	// Legacy command strings and disallowed structured commands are rejected
 	// BEFORE the task is persisted, so users learn immediately what to fix.
@@ -899,7 +465,6 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		await withTransaction((current) => {
 			current.push(task);
 		});
-		rescheduleAll(ctx);
 		return task;
 	}
 
@@ -926,9 +491,36 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		return withTransaction((current) => {
 			const visible = current.filter((task) => taskBelongsToSession(task, ctx));
 			const task = mutator(visible);
-			rescheduleAll(ctx);
 			return task;
 		});
+	}
+
+	function reportTaskFailure(task: ScheduledTask, error: any): void {
+		const ctx = activeCtx;
+		const message = `Scheduled task ${task.id} failed: ${error?.message ?? String(error)}`;
+		if (ctx?.hasUI) ctx.ui.notify(message, "error");
+		recordMessage(
+			`⚠️ ${message}`,
+			{
+				task: runtime.redactTaskForMessage(task),
+				error: error?.message ?? String(error),
+			},
+			false,
+		);
+	}
+
+	function reportPersistenceFailure(task: ScheduledTask, error: any): void {
+		const ctx = activeCtx;
+		const message = `Scheduled task ${task.id} completed but could not be persisted: ${error?.message ?? String(error)}`;
+		if (ctx?.hasUI) ctx.ui.notify(message, "warning");
+		recordMessage(
+			`⚠️ ${message}`,
+			{
+				task: runtime.redactTaskForMessage(task),
+				persistenceError: error?.message ?? String(error),
+			},
+			false,
+		);
 	}
 
 	pi.registerMessageRenderer("scheduled-task", (message, options, theme) => {
@@ -941,22 +533,21 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		activeCtx = ctx;
-		isShutdown = false;
-		await reloadTasks();
-		rescheduleAll(ctx);
+		engine.bind({
+			isInScope: (task) => taskBelongsToSession(task, ctx),
+			execute: (task, isLive) => executeTask(task, ctx, isLive),
+			reportTaskFailure,
+			reportPersistenceFailure,
+			onChange: () => updateStatus(ctx),
+		});
+		await engine.refresh();
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		// Mark the session ended and bump the generation so any in-flight fireTask
-		// or recovery sweep can detect the shutdown and refuse to reschedule or
-		// mutate state after this point (medium fix 6).
-		isShutdown = true;
-		sessionGeneration++;
-		clearTimers();
-		if (recoveryTimer) {
-			clearTimeout(recoveryTimer);
-			recoveryTimer = undefined;
-		}
+		// Mark the session ended: the engine bumps its generation and clears all
+		// timers so any in-flight fireTask or recovery sweep refuses to mutate
+		// state after this point (medium fix 6).
+		engine.shutdown();
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("scheduler", undefined);
 			ctx.ui.setWidget("scheduler", undefined);
@@ -1023,7 +614,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		description:
 			"List scheduled tasks; pass 'all' to include disabled/completed/cancelled/failed tasks",
 		handler: async (args, ctx) => {
-			await reloadTasks();
+			await engine.refresh();
 			const includeAll = args.trim().toLowerCase() === "all";
 			const visible = visibleTasks(ctx);
 			recordMessage(
@@ -1103,8 +694,6 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 					core.removeScheduledTask(current, visibleRemoved.id);
 					return visibleRemoved;
 				});
-				clearHandle(removed.id);
-				rescheduleAll(ctx);
 				ctx.ui.notify(`Removed scheduled task ${removed.id}`, "info");
 			} catch (error: any) {
 				ctx.ui.notify(error?.message ?? String(error), "error");
@@ -1131,8 +720,6 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				}
 				return removable;
 			});
-			for (const task of removed) clearHandle(task.id);
-			rescheduleAll(ctx);
 			ctx.ui.notify(`Cleaned up ${removed.length} scheduled task(s)`, "info");
 		},
 	});
@@ -1311,7 +898,9 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				content: [{ type: "text", text: taskCreatedText(task) }],
 				details: {
 					task: runtime.redactTaskForMessage(task),
-					pending: core.pendingTasks(tasks).map(runtime.redactTaskForMessage),
+					pending: core
+						.pendingTasks(engine.snapshot())
+						.map(runtime.redactTaskForMessage),
 				},
 			};
 		},
@@ -1349,7 +938,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			await reloadTasks();
+			await engine.refresh();
 			const visible = visibleTasks(ctx);
 			const text = core.formatTaskList(visible, new Date(), {
 				includeAll: Boolean(params.includeAll),
@@ -1381,7 +970,9 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				],
 				details: {
 					task: runtime.redactTaskForMessage(task),
-					pending: core.pendingTasks(tasks).map(runtime.redactTaskForMessage),
+					pending: core
+						.pendingTasks(engine.snapshot())
+						.map(runtime.redactTaskForMessage),
 				},
 			};
 		},
@@ -1442,8 +1033,6 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 					}
 					return removable;
 				});
-				for (const task of removed) clearHandle(task.id);
-				rescheduleAll(ctx);
 				return {
 					content: [
 						{
@@ -1488,15 +1077,15 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 					validateShellTaskAtScheduling(result, ctx);
 				return result;
 			});
-			if (params.action === "remove") clearHandle(task.id);
-			rescheduleAll(ctx);
 			return {
 				content: [
 					{ type: "text", text: `${params.action} scheduled task ${task.id}` },
 				],
 				details: {
 					task: runtime.redactTaskForMessage(task),
-					pending: core.pendingTasks(tasks).map(runtime.redactTaskForMessage),
+					pending: core
+						.pendingTasks(engine.snapshot())
+						.map(runtime.redactTaskForMessage),
 				},
 			};
 		},
