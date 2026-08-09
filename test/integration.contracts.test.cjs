@@ -657,16 +657,20 @@ test("schedule_task prompt nudges agents to arm a bounded GitHub PR watch", () =
 	assert.match(tool, /scheduler-rules\.md/);
 });
 
-test("schedule_task does not poll for pr_review findings", () => {
-	// pr_review delivers its asynchronous result into agent context. A scheduler
-	// watch would be redundant and can create needless wake-ups.
+test("schedule_task avoids pr_review-only polling while allowing existing PR watches", () => {
+	// pr_review delivers its asynchronous result into agent context. Avoid only
+	// polling that waits for those findings; existing PRs may still need monitoring.
 	const source = readFileSync(join(ROOT, "index.ts"), "utf8");
 	const tool = source.slice(
 		source.indexOf('name: "schedule_task"'),
 		source.indexOf('name: "list_scheduled_tasks"'),
 	);
-	assert.match(tool, /Do not schedule a watch for pr_review findings/);
+	assert.match(
+		tool,
+		/Do not schedule a watch whose sole purpose is waiting for pr_review findings/,
+	);
 	assert.match(tool, /delivered directly into agent context/);
+	assert.match(tool, /user-requested existing PRs/);
 });
 
 test("index.ts wires the fire-time settle through runClaimedExecution into the engine", () => {
